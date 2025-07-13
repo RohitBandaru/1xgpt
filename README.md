@@ -62,6 +62,37 @@ python visualize.py --token_dir data/genie_generated
 python genie/evaluate.py --checkpoint_dir data/genie_model/final_checkpt
 ```
 
+## V-JEPA (Alternative)
+
+This repo also provides a V-JEPA2-AC based world model as an alternative to GENIE. V-JEPA uses a pretrained ViT-Giant backbone (1.7B params) with action conditioning, potentially offering significant improvements over the GENIE baseline.
+
+```
+# Train V-JEPA model with cross-entropy loss
+python train.py --vjepa_config vjepa/configs/vjepa_vitg_1x.json --output_dir data/vjepa_model --max_eval_steps 10
+
+# Generate frames from trained V-JEPA model
+python vjepa/generate.py --checkpoint_dir data/vjepa_model/final_checkpt
+
+# Visualize generated frames
+python visualize.py --token_dir data/vjepa_generated
+
+# Evaluate the trained V-JEPA model
+python vjepa/evaluate.py --checkpoint_dir data/vjepa_model/final_checkpt
+```
+
+### V-JEPA vs GENIE Comparison
+
+| Model | Architecture | Parameters | Current Loss | Target |
+|-------|-------------|------------|--------------|---------|
+| **GENIE** | Spatio-temporal MaskGIT | 138M | 8.79 | Baseline |
+| **V-JEPA** | ViT-Giant + Action Conditioning | 1.7B | <7.5 (expected) | <8.0 (prize) |
+
+**Key V-JEPA advantages:**
+- 12x more parameters than GENIE
+- Pretrained on internet-scale video data  
+- Native action conditioning support
+- Multiple loss function options (cross-entropy, L1)
+
 ### 1X GENIE Baseline
 We provide two pre-trained GENIE models, linked in the [leaderboard](#leaderboard).
 ```

@@ -1,0 +1,29 @@
+{
+  "model_name": "vit_ac_giant",
+  "img_size": 256,
+  "patch_size": 16,
+  "tubelet_size": 2,
+  "num_frames": 16,
+  "pretrained": true,
+  
+  "pred_depth": 24,
+  "pred_num_heads": 16,
+  "pred_embed_dim": 1024,
+  "pred_is_frame_causal": true,
+  "use_extrinsics": false,
+  
+  "T": 16,
+  "S": 256,
+  "image_vocab_size": 262144,
+  
+  "num_factored_vocabs": 2,
+  "factored_vocab_size": 512,
+  
+  "action_vocab_size": 65536,
+  "action_embed_dim": 256,
+  
+  "loss_type": "cross_entropy",
+  "l1_loss_weight": 1.0,
+  "token_loss_weight": 1.0,
+  "freeze_backbone": true
+}

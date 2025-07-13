@@ -26,6 +26,8 @@ from transformers import (
 from data import RawTokenDataset, get_maskgit_collator
 from eval_utils import decode_tokens, compute_lpips
 from genie.st_mask_git import GenieConfig, STMaskGIT
+from vjepa.config import VJEPAConfig
+from vjepa.model import VJEPAWorldModel
 # from llama.config import LlamaConfig1X
 # from llama.modeling_llama_mup import LlamaForCausalLM
 from visualize import decode_latents_wrapper
@@ -83,6 +85,11 @@ def parse_args():
         "--genie_config",
         type=str,
         help="GenieConfig json."
+    )
+    parser.add_argument(
+        "--vjepa_config",
+        type=str,
+        help="VJEPAConfig json."
     ),
     parser.add_argument(
         "--warmstart_path",
@@ -324,8 +331,9 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
 
 def main():
     args = parse_args()
-    assert (args.llama_config is not None) ^ (args.genie_config is not None), \
-        "Exactly one of `llama_config` and `genie_config` should be set."
+    config_count = sum([args.llama_config is not None, args.genie_config is not None, args.vjepa_config is not None])
+    assert config_count == 1, \
+        "Exactly one of `llama_config`, `genie_config`, or `vjepa_config` should be set."
 
     # Manual gradient accumulation
     accelerator = Accelerator(gradient_accumulation_steps=1, log_with=args.report_to, project_dir=args.output_dir)
@@ -411,7 +419,7 @@ def main():
         #     model = AutoModelForCausalLM.from_config(config,
         #                                              torch_dtype=torch.bfloat16,
         #                                              attn_implementation="flash_attention_2")
-    else:
+    elif args.genie_config is not None:
         config = GenieConfig.from_pretrained(args.genie_config)
         config.use_mup = args.mu_transfer  # Note: changing this may affect pre-trained model due to attn scaling
         config.image_vocab_size = vocab_size
@@ -422,6 +430,16 @@ def main():
         if args.mu_transfer:
             model.set_mup_shapes(rescale_params=True)
             model.init_weights()  # might be unnecessary if `rescale_params` is True
+    else:  # args.vjepa_config is not None
+        config = VJEPAConfig.from_pretrained(args.vjepa_config)
+        config.image_vocab_size = vocab_size
+        config.T = args.window_size
+        config.S = latent_side_len**2
+        model = VJEPAWorldModel(config)
+        
+        # V-JEPA doesn't support mu_transfer currently
+        if args.mu_transfer:
+            logger.warning("mu_transfer not supported for V-JEPA models, ignoring flag")
 
     # Optimizer. Split weights in two groups, one with weight decay and the other not.
     no_decay = ["bias", "layer_norm.weight"]
@@ -441,7 +459,13 @@ def main():
                           betas=(args.adam_beta_1, args.adam_beta_2), eps=args.adam_eps)
 
     # DataLoaders creation:
-    collate_fn = default_data_collator if args.llama_config is not None else get_maskgit_collator(config)
+    if args.llama_config is not None:
+        collate_fn = default_data_collator
+    elif args.vjepa_config is not None:
+        # V-JEPA uses same collator as GENIE (MaskGIT-style)
+        collate_fn = get_maskgit_collator(config)
+    else:  # GENIE
+        collate_fn = get_maskgit_collator(config)
     train_dataloader = DataLoader(
         train_dataset, shuffle=True, collate_fn=collate_fn,
         batch_size=args.per_device_train_batch_size, num_workers=4, pin_memory=True,
