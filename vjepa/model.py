@@ -189,7 +189,10 @@ class VJEPAWorldModel(PreTrainedModel):
         
         # Identify masked positions (same as GENIE approach)
         mask_token_id = self.config.image_vocab_size
-        masked_positions = (x_THW == mask_token_id)  # [B, T, H, W]
+        # GENIE excludes first frame from loss computation: x_THW[:, 1:]
+        relevant_mask = x_THW[:, 1:] == mask_token_id  # [B, T-1, H, W] 
+        masked_positions = torch.zeros_like(x_THW, dtype=torch.bool)
+        masked_positions[:, 1:] = relevant_mask  # Only frames 1 to T-1
         
         # Convert discrete tokens to continuous embeddings
         # Handle mask tokens properly - they should get special mask embeddings
@@ -232,38 +235,54 @@ class VJEPAWorldModel(PreTrainedModel):
                 self.config.factored_vocab_size
             )
             
-            # CRITICAL FIX: Only compute loss on masked positions (like GENIE)
-            # This prevents label leakage by only predicting tokens that were actually masked
+            # ALIGNED WITH GENIE: Compute loss exactly like GENIE does
+            # Only on masked positions, excluding first frame, using GENIE's reduction strategy
             
-            # Combine factorized logits for loss computation
-            factored_logits = torch.stack([logits_1, logits_2], dim=1)  # [B, 2, N, 512]
+            # Reshape labels to match GENIE format: exclude first frame
+            labels_THW_no_first = labels_THW[:, 1:]  # [B, T-1, H, W] - like GENIE
+            factored_labels_no_first = factorize_labels(
+                labels_THW_no_first,
+                self.config.num_factored_vocabs,
+                self.config.factored_vocab_size
+            )  # [B, 2, T-1, H, W]
             
-            # Apply mask to only compute loss on masked positions
-            # Expand mask for factorized dimensions: [B, N] -> [B, 2, N]
-            mask_expanded = masked_positions_flat.unsqueeze(1).expand(-1, 2, -1)  # [B, 2, N]
+            # Reshape predictions to match (exclude first frame predictions)
+            # logits_1/2 are [B, T*H*W, 512], reshape and exclude first frame
+            logits_1_THW = logits_1.view(B, T, H, W, -1)[:, 1:]  # [B, T-1, H, W, 512]
+            logits_2_THW = logits_2.view(B, T, H, W, -1)[:, 1:]  # [B, T-1, H, W, 512]
             
-            # Select only masked positions for loss computation
-            masked_logits = factored_logits[mask_expanded]  # [num_masked*2, 512]
-            masked_labels = factored_labels.reshape(B, 2, -1)[mask_expanded]  # [num_masked*2]
+            # Stack factorized logits like GENIE: [B, 2, T-1, H, W, 512]
+            factored_logits = torch.stack([logits_1_THW, logits_2_THW], dim=1)
             
-            # Cross-entropy loss only on masked positions (preventing label leakage)
-            if masked_logits.numel() > 0:  # Check if there are any masked positions
-                token_loss = F.cross_entropy(masked_logits, masked_labels, reduction="mean")
+            # Cross-entropy loss with reduction="none" then sum across vocabs (like GENIE)
+            loss_THW = F.cross_entropy(
+                factored_logits.view(B, 2, -1, 512),  # [B, 2, (T-1)*H*W, 512]
+                factored_labels_no_first.view(B, 2, -1),  # [B, 2, (T-1)*H*W]
+                reduction="none"
+            ).sum(dim=1)  # [B, (T-1)*H*W] - sum across factorized vocabs
+            
+            # Reshape back to spatial format
+            loss_THW = loss_THW.view(B, T-1, H, W)  # [B, T-1, H, W]
+            
+            # Compute mean loss over masked positions only (like GENIE)
+            relevant_mask_THW = relevant_mask  # [B, T-1, H, W]
+            num_masked_tokens = torch.sum(relevant_mask_THW)
+            if num_masked_tokens > 0:
+                token_loss = torch.sum(loss_THW * relevant_mask_THW) / num_masked_tokens
             else:
                 token_loss = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
             
-            # Accuracy (also only on masked positions)
-            pred_tokens_1 = logits_1.argmax(dim=-1)  # [B, N]
-            pred_tokens_2 = logits_2.argmax(dim=-1)  # [B, N]
+            # Accuracy computation (aligned with GENIE): exact match across ALL factorized vocabs
+            pred_1_THW = logits_1_THW.argmax(dim=-1)  # [B, T-1, H, W]
+            pred_2_THW = logits_2_THW.argmax(dim=-1)  # [B, T-1, H, W]
             
-            # Reshape factored_labels to match predictions
-            target_1 = factored_labels[:, 0].reshape(B, -1)  # [B, T*H*W]
-            target_2 = factored_labels[:, 1].reshape(B, -1)  # [B, T*H*W]
+            # GENIE accuracy: exact match across all factorized vocabularies
+            acc_THW = ((pred_1_THW == factored_labels_no_first[:, 0]) & 
+                       (pred_2_THW == factored_labels_no_first[:, 1]))  # [B, T-1, H, W]
             
-            # Accuracy only on masked positions
-            if masked_positions_flat.sum() > 0:
-                correct_preds = ((pred_tokens_1 == target_1) & (pred_tokens_2 == target_2))
-                acc = correct_preds[masked_positions_flat].float().mean()
+            # Mean accuracy over masked positions only (like GENIE)
+            if num_masked_tokens > 0:
+                acc = torch.sum(acc_THW * relevant_mask_THW).float() / num_masked_tokens
             else:
                 acc = torch.tensor(0.0, device=input_ids.device)
                 

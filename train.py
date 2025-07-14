@@ -228,6 +228,12 @@ def parse_args():
         help="Name for the wandb run. If not specified, wandb will auto-generate one.",
     )
     parser.add_argument(
+        "--wandb_project_name",
+        type=str,
+        default="1XGPT_muP_MAGVIT2_v0",
+        help="Name for the wandb project. Defaults to '1XGPT_muP_MAGVIT2_v0'.",
+    )
+    parser.add_argument(
         "--mu_transfer",
         action="store_true",
         help="If specified, will train with mu transfer reparametrizations. Only supports Llama models."
@@ -586,8 +592,8 @@ def main():
     experiment_config["FLOPs_per_update_step"] = 6 * experiment_config["model_parameters"] \
                                                  * experiment_config["effective_batch_size_tokens"]
 
-    # Initialize wandb tracker with optional run name
-    init_kwargs = {"project_name": "1XGPT_muP_MAGVIT2_v0", "config": experiment_config}
+    # Initialize wandb tracker with optional project and run name
+    init_kwargs = {"project_name": args.wandb_project_name, "config": experiment_config}
     if args.wandb_run_name:
         init_kwargs["init_kwargs"] = {"wandb": {"name": args.wandb_run_name}}
     
