@@ -255,14 +255,21 @@ class VJEPAWorldModel(PreTrainedModel):
             factored_logits = torch.stack([logits_1_THW, logits_2_THW], dim=1)
             
             # Cross-entropy loss with reduction="none" then sum across vocabs (like GENIE)
-            loss_THW = F.cross_entropy(
-                factored_logits.view(B, 2, -1, 512),  # [B, 2, (T-1)*H*W, 512]
-                factored_labels_no_first.view(B, 2, -1),  # [B, 2, (T-1)*H*W]
+            # Process each factorized vocabulary separately
+            loss_1 = F.cross_entropy(
+                logits_1_THW.reshape(-1, 512),  # [B*(T-1)*H*W, 512] 
+                factored_labels_no_first[:, 0].reshape(-1),  # [B*(T-1)*H*W]
                 reduction="none"
-            ).sum(dim=1)  # [B, (T-1)*H*W] - sum across factorized vocabs
+            ).view(B, T-1, H, W)  # [B, T-1, H, W]
             
-            # Reshape back to spatial format
-            loss_THW = loss_THW.view(B, T-1, H, W)  # [B, T-1, H, W]
+            loss_2 = F.cross_entropy(
+                logits_2_THW.reshape(-1, 512),  # [B*(T-1)*H*W, 512]
+                factored_labels_no_first[:, 1].reshape(-1),  # [B*(T-1)*H*W] 
+                reduction="none"
+            ).view(B, T-1, H, W)  # [B, T-1, H, W]
+            
+            # Sum losses across factorized vocabs (like GENIE)
+            loss_THW = loss_1 + loss_2  # [B, T-1, H, W]
             
             # Compute mean loss over masked positions only (like GENIE)
             relevant_mask_THW = relevant_mask  # [B, T-1, H, W]
