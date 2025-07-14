@@ -59,7 +59,7 @@ python genie/generate.py --checkpoint_dir data/genie_model/final_checkpt
 python visualize.py --token_dir data/genie_generated
 
 # Evaluate the trained model
-python genie/evaluate.py --checkpoint_dir data/genie_model/final_checkpt
+python evaluate.py --model_type genie --checkpoint_dir data/genie_model/final_checkpt
 ```
 
 ## V-JEPA (Alternative)
@@ -77,7 +77,7 @@ python vjepa/generate.py --checkpoint_dir data/vjepa_model/final_checkpt
 python visualize.py --token_dir data/vjepa_generated
 
 # Evaluate the trained V-JEPA model
-python vjepa/evaluate.py --checkpoint_dir data/vjepa_model/final_checkpt
+python evaluate.py --model_type vjepa --checkpoint_dir data/vjepa_model/final_checkpt
 ```
 
 ### V-JEPA vs GENIE Comparison
@@ -107,7 +107,7 @@ for i in {0..240..10}; do
 done
 
 # Evaluate
-python genie/evaluate.py --checkpoint_dir 1x-technologies/GENIE_138M --maskgit_steps 2
+python evaluate.py --model_type genie --checkpoint_dir 1x-technologies/GENIE_138M --maskgit_steps 2
 ```
  
 ## Data Description
@@ -133,8 +133,32 @@ After manually reviewing your code, we run evals in a 22.04 + CUDA 12.3 sandboxe
 
 ```
 ./build.sh # installs any dependencies + model weights you need
-./evaluate.py --val_data_dir <PATH-TO-HELD-OUT-DATA>  # runs your model on held-out data
+python evaluate.py --model_type <MODEL_TYPE> --checkpoint_dir <YOUR_CHECKPOINT> --val_data_dir <PATH-TO-HELD-OUT-DATA>  # runs your model on held-out data
 ```
+
+## Evaluation Framework
+
+We've refactored the evaluation code to reduce duplication between models. The shared evaluation framework is located at `evaluate.py` and supports both GENIE and V-JEPA models:
+
+```bash
+# Evaluate GENIE models
+python evaluate.py --model_type genie --checkpoint_dir <checkpoint_path> [--maskgit_steps 2] [--temperature 0]
+
+# Evaluate V-JEPA models  
+python evaluate.py --model_type vjepa --checkpoint_dir <checkpoint_path>
+
+# Common options for both models
+python evaluate.py --model_type <genie|vjepa> \
+    --checkpoint_dir <checkpoint_path> \
+    --val_data_dir data/val_v1.1 \
+    --batch_size 16 \
+    --max_examples 100 \
+    --save_outputs_dir outputs/ \
+    --skip_lpips \
+    --device cuda
+```
+
+The original `genie/evaluate.py` and `vjepa/evaluate.py` scripts are deprecated but will redirect to the shared framework for backward compatibility.
 
 ## Additional Challenge Details
 
