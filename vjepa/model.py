@@ -79,6 +79,11 @@ class VJEPAWorldModel(PreTrainedModel):
         # Load pretrained V-JEPA2-AC backbone
         self._load_vjepa_backbone()
         
+        # Token embedding layer to convert discrete tokens to continuous embeddings
+        # This bridges the gap between tokenized input and V-JEPA's continuous representations
+        # +1 to account for mask token at image_vocab_size
+        self.token_embedding = nn.Embedding(config.image_vocab_size + 1, self.encoder.embed_dim)
+        
         # Action embedding for 1X scalar actions
         self.action_embedding = ActionEmbedding(
             config.action_vocab_size, 
@@ -103,44 +108,28 @@ class VJEPAWorldModel(PreTrainedModel):
         
     def _load_vjepa_backbone(self):
         """Load pretrained V-JEPA2-AC encoder and predictor"""
-        try:
-            # This will be the actual V-JEPA2 import when integrated
-            # from vjepa2.src.hub.backbones import vjepa2_ac_vit_giant
-            # self.encoder, self.predictor = vjepa2_ac_vit_giant(pretrained=self.config.pretrained)
-            
-            # Placeholder for now - will be replaced with actual V-JEPA2 loading
-            print("Loading V-JEPA2-AC backbone...")
-            print(f"Model: {self.config.model_name}")
-            print(f"Pretrained: {self.config.pretrained}")
-            
-            # TODO: Implement actual V-JEPA2-AC loading
-            # For now, create placeholder modules
-            class PlaceholderEncoder(nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    self.embed_dim = 1408  # ViT-Giant embed dim
-                    
-                def forward(self, x):
-                    B, T, H, W = x.shape
-                    return torch.randn(B, T * H * W, self.embed_dim, device=x.device, dtype=torch.float32)
-            
-            class PlaceholderPredictor(nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    
-                def forward(self, x, actions, states, extrinsics=None):
-                    return x  # Pass through for now
-            
-            self.encoder = PlaceholderEncoder()
-            self.predictor = PlaceholderPredictor()
-            
-        except ImportError:
-            raise ImportError(
-                "V-JEPA2 not found. Please ensure V-JEPA2 is installed and available."
-            )
+        # Load V-JEPA2-AC via PyTorch Hub (as per README instructions)
+        print("Loading V-JEPA2-AC backbone via PyTorch Hub...")
+        print(f"Pretrained: {self.config.pretrained}")
+        
+        # Load V-JEPA2-AC without conflicting parameters
+        self.encoder, self.predictor = torch.hub.load(
+            'facebookresearch/vjepa2', 
+            'vjepa2_ac_vit_giant', 
+            pretrained=self.config.pretrained,
+            verbose=False
+        )
+        
+        print(f"Loaded V-JEPA2-AC ViT-Giant:")
+        print(f"  Encoder embed_dim: {self.encoder.embed_dim}")
+        print(f"  Encoder depth: {getattr(self.encoder, 'depth', 'N/A')}")
+        print(f"  Encoder num_heads: {getattr(self.encoder, 'num_heads', 'N/A')}")
     
     def _init_new_weights(self):
         """Initialize newly added components"""
+        # Initialize token embedding
+        nn.init.normal_(self.token_embedding.weight, std=0.02)
+        
         # Initialize action embedding
         nn.init.normal_(self.action_embedding.action_embed.weight, std=0.02)
         
@@ -162,7 +151,10 @@ class VJEPAWorldModel(PreTrainedModel):
         for param in self.predictor.parameters():
             param.requires_grad = False
             
-        # Keep action embedding and token predictor trainable
+        # Keep token embedding, action embedding and token predictor trainable
+        for param in self.token_embedding.parameters():
+            param.requires_grad = True
+            
         for param in self.action_embedding.parameters():
             param.requires_grad = True
             
@@ -195,8 +187,12 @@ class VJEPAWorldModel(PreTrainedModel):
         # Reshape to spatial-temporal format
         x_THW = input_ids.view(B, T, H, W)
         
-        # Encode video frames
-        z = self.encoder(x_THW)  # [B, T*H*W, embed_dim]
+        # Convert discrete tokens to continuous embeddings
+        # Bypass V-JEPA's patch embedding and work directly in embedding space
+        x_emb = self.token_embedding(x_THW.long())  # [B, T, H, W, embed_dim]
+        
+        # Flatten to sequence format expected by V-JEPA transformer blocks
+        z = x_emb.view(B, T * H * W, self.encoder.embed_dim)  # [B, T*H*W, embed_dim]
         
         # Prepare actions if provided
         if action_tokens is not None:
@@ -358,12 +354,3 @@ class VJEPAWorldModel(PreTrainedModel):
         # Return flattened tokens
         return current_tokens.view(B, -1)
 
-
-def create_vjepa_model(config_path: Optional[str] = None, **kwargs) -> VJEPAWorldModel:
-    """Factory function to create V-JEPA world model"""
-    if config_path:
-        config = VJEPAConfig.from_pretrained(config_path)
-    else:
-        config = VJEPAConfig(**kwargs)
-    
-    return VJEPAWorldModel(config)
