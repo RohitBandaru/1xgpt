@@ -259,12 +259,98 @@ class VJEPAWorldModel(PreTrainedModel):
         input_ids: torch.LongTensor,
         action_tokens: Optional[torch.LongTensor] = None,
         max_new_tokens: int = 256,
+        temperature: float = 0.0,
         **kwargs
-    ):
-        """Generate future tokens autoregressively"""
-        # TODO: Implement generation logic similar to GENIE
-        # This would use the factorized token heads to predict next frame tokens
-        pass
+    ) -> torch.LongTensor:
+        """Generate future tokens autoregressively using factorized token prediction
+        
+        Args:
+            input_ids: [B, T*H*W] flattened image tokens for context frames
+            action_tokens: [B, T_new] scalar action tokens for generation steps
+            max_new_tokens: Number of new tokens to generate (must be multiple of S)
+            temperature: Sampling temperature (0.0 for greedy)
+            
+        Returns:
+            generated_tokens: [B, (T + T_new)*H*W] input + generated tokens
+        """
+        assert max_new_tokens % self.config.S == 0, "max_new_tokens must be multiple of S"
+        num_new_frames = max_new_tokens // self.config.S
+        
+        B, seq_len = input_ids.shape
+        T, H, W = self.config.T, int(self.config.S**0.5), int(self.config.S**0.5)
+        
+        # Reshape input to spatial-temporal format
+        current_tokens = input_ids.view(B, T, H, W)
+        
+        # Generate frames autoregressively
+        for frame_idx in range(num_new_frames):
+            # Prepare action for this frame if provided
+            current_action = None
+            if action_tokens is not None:
+                if frame_idx < action_tokens.size(1):
+                    current_action = action_tokens[:, frame_idx:frame_idx+1]
+            
+            # Run forward pass to get predictions for next frame
+            with torch.no_grad():
+                # Flatten current tokens for forward pass
+                current_flat = current_tokens.view(B, -1)
+                
+                # Forward pass
+                outputs = self.forward(
+                    input_ids=current_flat,
+                    action_tokens=current_action
+                )
+                
+                # Get logits for the last spatial positions (next frame)
+                logits = outputs.logits  # [B, 2, (T*H*W), 512]
+                
+                # Extract logits for next frame positions
+                next_frame_start = (T + frame_idx) * H * W
+                next_frame_end = next_frame_start + H * W
+                
+                if next_frame_end <= logits.size(2):
+                    next_frame_logits = logits[:, :, next_frame_start:next_frame_end, :]  # [B, 2, H*W, 512]
+                else:
+                    # Predict using last frame's representation
+                    last_frame_logits = logits[:, :, -H*W:, :]  # [B, 2, H*W, 512]
+                    next_frame_logits = last_frame_logits
+                
+                # Sample from factorized distributions
+                next_frame_tokens = torch.zeros(B, H, W, dtype=torch.long, device=input_ids.device)
+                
+                # Sample each factor
+                for factor_idx in range(2):  # num_factored_vocabs = 2
+                    factor_logits = next_frame_logits[:, factor_idx]  # [B, H*W, 512]
+                    
+                    if temperature <= 1e-8:
+                        # Greedy sampling
+                        factor_tokens = factor_logits.argmax(dim=-1)  # [B, H*W]
+                    else:
+                        # Temperature sampling
+                        probs = F.softmax(factor_logits / temperature, dim=-1)
+                        dist = torch.distributions.categorical.Categorical(probs=probs)
+                        factor_tokens = dist.sample()  # [B, H*W]
+                    
+                    # Reshape to spatial
+                    factor_tokens_hw = factor_tokens.view(B, H, W)
+                    
+                    # Combine factors: token = factor1 * vocab_size + factor2
+                    if factor_idx == 0:
+                        next_frame_tokens = factor_tokens_hw * self.config.factored_vocab_size
+                    else:
+                        next_frame_tokens += factor_tokens_hw
+                
+                # Append new frame to sequence
+                current_tokens = torch.cat([
+                    current_tokens,
+                    next_frame_tokens.unsqueeze(1)
+                ], dim=1)
+                
+                # Update T for next iteration
+                T += 1
+        
+        # Return flattened tokens
+        return current_tokens.view(B, -1)
 
 
 def create_vjepa_model(config_path: Optional[str] = None, **kwargs) -> VJEPAWorldModel:
