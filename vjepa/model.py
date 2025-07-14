@@ -187,12 +187,19 @@ class VJEPAWorldModel(PreTrainedModel):
         # Reshape to spatial-temporal format
         x_THW = input_ids.view(B, T, H, W)
         
+        # Identify masked positions (same as GENIE approach)
+        mask_token_id = self.config.image_vocab_size
+        masked_positions = (x_THW == mask_token_id)  # [B, T, H, W]
+        
         # Convert discrete tokens to continuous embeddings
-        # Bypass V-JEPA's patch embedding and work directly in embedding space
+        # Handle mask tokens properly - they should get special mask embeddings
         x_emb = self.token_embedding(x_THW.long())  # [B, T, H, W, embed_dim]
         
         # Flatten to sequence format expected by V-JEPA transformer blocks
         z = x_emb.view(B, T * H * W, self.encoder.embed_dim)  # [B, T*H*W, embed_dim]
+        
+        # Store masked positions for loss computation (flatten to match z)
+        masked_positions_flat = masked_positions.view(B, T * H * W)  # [B, T*H*W]
         
         # Prepare actions if provided
         if action_tokens is not None:
@@ -225,17 +232,27 @@ class VJEPAWorldModel(PreTrainedModel):
                 self.config.factored_vocab_size
             )
             
+            # CRITICAL FIX: Only compute loss on masked positions (like GENIE)
+            # This prevents label leakage by only predicting tokens that were actually masked
+            
             # Combine factorized logits for loss computation
             factored_logits = torch.stack([logits_1, logits_2], dim=1)  # [B, 2, N, 512]
             
-            # Reshape for cross-entropy: [B*2*N, 512] and [B*2*N]
-            logits_flat = factored_logits.reshape(-1, factored_logits.size(-1))  # [B*2*N, 512]
-            labels_flat = factored_labels.reshape(-1)  # [B*2*T*H*W]
+            # Apply mask to only compute loss on masked positions
+            # Expand mask for factorized dimensions: [B, N] -> [B, 2, N]
+            mask_expanded = masked_positions_flat.unsqueeze(1).expand(-1, 2, -1)  # [B, 2, N]
             
-            # Cross-entropy loss on factorized vocabulary
-            token_loss = F.cross_entropy(logits_flat, labels_flat, reduction="mean")
+            # Select only masked positions for loss computation
+            masked_logits = factored_logits[mask_expanded]  # [num_masked*2, 512]
+            masked_labels = factored_labels.reshape(B, 2, -1)[mask_expanded]  # [num_masked*2]
             
-            # Accuracy
+            # Cross-entropy loss only on masked positions (preventing label leakage)
+            if masked_logits.numel() > 0:  # Check if there are any masked positions
+                token_loss = F.cross_entropy(masked_logits, masked_labels, reduction="mean")
+            else:
+                token_loss = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+            
+            # Accuracy (also only on masked positions)
             pred_tokens_1 = logits_1.argmax(dim=-1)  # [B, N]
             pred_tokens_2 = logits_2.argmax(dim=-1)  # [B, N]
             
@@ -243,8 +260,12 @@ class VJEPAWorldModel(PreTrainedModel):
             target_1 = factored_labels[:, 0].reshape(B, -1)  # [B, T*H*W]
             target_2 = factored_labels[:, 1].reshape(B, -1)  # [B, T*H*W]
             
-            acc = ((pred_tokens_1 == target_1) & 
-                   (pred_tokens_2 == target_2)).float().mean()
+            # Accuracy only on masked positions
+            if masked_positions_flat.sum() > 0:
+                correct_preds = ((pred_tokens_1 == target_1) & (pred_tokens_2 == target_2))
+                acc = correct_preds[masked_positions_flat].float().mean()
+            else:
+                acc = torch.tensor(0.0, device=input_ids.device)
                 
             total_loss = self.config.token_loss_weight * token_loss
         
