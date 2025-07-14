@@ -51,6 +51,10 @@ def parse_args():
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to use for evaluation."
     )
+    parser.add_argument(
+        "--skip_lpips", action="store_true",
+        help="Skip LPIPS computation to speed up evaluation."
+    )
     
     return parser.parse_args()
 
@@ -161,22 +165,23 @@ def main():
         metrics["acc"].update(acc, batch_size)
         
         # Decode frames for LPIPS calculation
-        start_time = time.time()
-        pred_frames = decode_tokens(predicted_tokens.cpu(), decode_latents)
-        decoded_gtruth = decode_tokens(reshaped_input_ids.cpu(), decode_latents)
-        dec_time = (time.time() - start_time) / (15 * batch_size)
-        metrics["dec_time"].update(dec_time, batch_size)
-        
-        # Compute LPIPS
-        lpips_scores = compute_lpips(decoded_gtruth, pred_frames, lpips_alex)
-        metrics["pred_lpips"].update_list(lpips_scores)
+        if not args.skip_lpips:
+            start_time = time.time()
+            pred_frames = decode_tokens(predicted_tokens.cpu(), decode_latents)
+            decoded_gtruth = decode_tokens(reshaped_input_ids.cpu(), decode_latents)
+            dec_time = (time.time() - start_time) / (15 * batch_size)
+            metrics["dec_time"].update(dec_time, batch_size)
+            
+            # Compute LPIPS
+            lpips_scores = compute_lpips(decoded_gtruth, pred_frames, lpips_alex)
+            metrics["pred_lpips"].update_list(lpips_scores)
         
         # Print progress
         if batch_idx % 10 == 0:
             print(f"Batch {batch_idx}: {dict((key, f'{val.mean():.4f}') for key, val in metrics.items())}")
         
         # Save outputs if requested
-        if args.save_outputs_dir is not None:
+        if args.save_outputs_dir is not None and not args.skip_lpips:
             outputs_to_save["pred_frames"].append(pred_frames)
             outputs_to_save["pred_logits"].append(factored_logits.cpu())
             outputs_to_save["gtruth_frames"].append(decoded_gtruth)
@@ -189,26 +194,8 @@ def main():
     for key, val in metrics.items():
         print(f"{key:15s}: {val.mean():.4f}")
     
-    # Compare with GENIE baseline
-    current_loss = metrics["loss"].mean()
-    genie_baseline = 8.79
-    target_loss = 8.0
-    
-    print(f"\nComparison:")
-    print(f"V-JEPA Loss:     {current_loss:.4f}")
-    print(f"GENIE Baseline:  {genie_baseline:.4f}")
-    print(f"Target (Prize):  {target_loss:.4f}")
-    print(f"Improvement:     {genie_baseline - current_loss:.4f}")
-    
-    if current_loss < target_loss:
-        print("🎉 TARGET ACHIEVED! This model would win the $10k prize!")
-    elif current_loss < genie_baseline:
-        print("✅ Improvement over GENIE baseline!")
-    else:
-        print("❌ No improvement over baseline yet.")
-    
     # Save outputs if requested
-    if args.save_outputs_dir is not None:
+    if args.save_outputs_dir is not None and not args.skip_lpips:
         from pathlib import Path
         save_path = Path(args.save_outputs_dir)
         torch.save(torch.cat(outputs_to_save["pred_frames"], dim=0).cpu(), save_path / "pred_frames.pt")

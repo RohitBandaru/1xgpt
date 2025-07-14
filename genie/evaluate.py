@@ -62,6 +62,10 @@ def parse_args():
         "--max_examples", type=int,
         help="If specified, will stop evaluation early after `max_examples` examples."
     )
+    parser.add_argument(
+        "--skip_lpips", action="store_true",
+        help="Skip LPIPS computation to speed up evaluation (only compute loss and accuracy)."
+    )
 
     return parser.parse_args()
 
@@ -181,19 +185,28 @@ def main():
         metrics["loss"].update(loss, batch_size)
         metrics["acc"].update(acc, batch_size)
 
-        start_time = time.time()
-        pred_frames = evaluator.predict_next_frames(samples)
-        metrics["dec_time"].update((time.time() - start_time) / frames_per_batch, batch_size)
+        # Only compute LPIPS if not skipped (slow image decoding)
+        if not args.skip_lpips:
+            start_time = time.time()
+            pred_frames = evaluator.predict_next_frames(samples)
+            metrics["dec_time"].update((time.time() - start_time) / frames_per_batch, batch_size)
 
-        decoded_gtruth = decode_tokens(reshaped_input_ids, decode_latents)
-        metrics["pred_lpips"].update_list(compute_lpips(decoded_gtruth[:, 1:], pred_frames, lpips_alex))
+            decoded_gtruth = decode_tokens(reshaped_input_ids, decode_latents)
+            metrics["pred_lpips"].update_list(compute_lpips(decoded_gtruth[:, 1:], pred_frames, lpips_alex))
         
         print({key: f"{val.mean():.4f}" for key, val in metrics.items()})
-        if args.save_outputs_dir is not None:
+        if args.save_outputs_dir is not None and not args.skip_lpips:
             outputs_to_save["pred_frames"].append(pred_frames)
             outputs_to_save["pred_logits"].append(factored_logits)
             outputs_to_save["gtruth_frames"].append(decoded_gtruth)
             outputs_to_save["gtruth_tokens"].append(reshaped_input_ids)
+
+    # Final results
+    print("\n" + "="*50)
+    print("GENIE Evaluation Results:")
+    print("="*50)
+    for key, val in metrics.items():
+        print(f"{key:15s}: {val.mean():.4f}")
 
     if args.save_outputs_dir is not None:
         os.makedirs(args.save_outputs_dir, exist_ok=True)
