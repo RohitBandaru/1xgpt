@@ -7,12 +7,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Union
+from dataclasses import dataclass
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from .config import VJEPAConfig
 
 
+@dataclass
 class VJEPAModelOutput(ModelOutput):
     """Output of V-JEPA world model"""
     loss: Optional[torch.FloatTensor] = None
@@ -120,7 +122,7 @@ class VJEPAWorldModel(PreTrainedModel):
                     
                 def forward(self, x):
                     B, T, H, W = x.shape
-                    return torch.randn(B, T * H * W, self.embed_dim)
+                    return torch.randn(B, T * H * W, self.embed_dim, device=x.device, dtype=torch.float32)
             
             class PlaceholderPredictor(nn.Module):
                 def __init__(self):
@@ -229,20 +231,24 @@ class VJEPAWorldModel(PreTrainedModel):
             
             # Combine factorized logits for loss computation
             factored_logits = torch.stack([logits_1, logits_2], dim=1)  # [B, 2, N, 512]
-            factored_logits = factored_logits.permute(0, 3, 1, 2)  # [B, 512, 2, N]
+            
+            # Reshape for cross-entropy: [B*2*N, 512] and [B*2*N]
+            logits_flat = factored_logits.reshape(-1, factored_logits.size(-1))  # [B*2*N, 512]
+            labels_flat = factored_labels.reshape(-1)  # [B*2*T*H*W]
             
             # Cross-entropy loss on factorized vocabulary
-            token_loss = F.cross_entropy(
-                factored_logits.flatten(0, 1), 
-                factored_labels.flatten(0, 1), 
-                reduction="none"
-            ).view(B, 2, -1).sum(dim=1).mean()
+            token_loss = F.cross_entropy(logits_flat, labels_flat, reduction="mean")
             
             # Accuracy
-            pred_tokens_1 = logits_1.argmax(dim=-1)
-            pred_tokens_2 = logits_2.argmax(dim=-1)
-            acc = ((pred_tokens_1 == factored_labels[:, 0]) & 
-                    (pred_tokens_2 == factored_labels[:, 1])).float().mean()
+            pred_tokens_1 = logits_1.argmax(dim=-1)  # [B, N]
+            pred_tokens_2 = logits_2.argmax(dim=-1)  # [B, N]
+            
+            # Reshape factored_labels to match predictions
+            target_1 = factored_labels[:, 0].reshape(B, -1)  # [B, T*H*W]
+            target_2 = factored_labels[:, 1].reshape(B, -1)  # [B, T*H*W]
+            
+            acc = ((pred_tokens_1 == target_1) & 
+                   (pred_tokens_2 == target_2)).float().mean()
                 
             total_loss = self.config.token_loss_weight * token_loss
         
