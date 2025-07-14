@@ -36,6 +36,9 @@ class GenieConfig:
     mlp_ratio: float = 4.0
     mlp_drop: float = 0.0
     mlp_bias: bool = True
+    
+    # Training
+    freeze_backbone: bool = False
 
     def save_pretrained(self, json_path):
         with open(json_path, "w") as f:

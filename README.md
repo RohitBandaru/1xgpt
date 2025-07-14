@@ -160,6 +160,27 @@ python evaluate.py --model_type <genie|vjepa> \
 
 The original `genie/evaluate.py` and `vjepa/evaluate.py` scripts are deprecated but will redirect to the shared framework for backward compatibility.
 
+## Fine-tuning GENIE 
+Not sure if this is beneficial since we have to backprop through the transformer to get the gradients for token_embed
+```
+### Fine-tuning Examples
+
+```bash
+# Full model fine-tuning (default)
+python train.py --genie_config genie/configs/magvit_n32_h8_d256.json \
+    --warmstart_path 1x-technologies/GENIE_138M \
+    --output_dir data/genie_full_finetune
+
+# Backbone-frozen fine-tuning (efficient transfer learning) 
+python train.py --genie_config genie/configs/magvit_n32_h8_d256_finetune.json \
+    --warmstart_path 1x-technologies/GENIE_138M \
+    --output_dir data/genie_efficient_finetune
+
+# Evaluate fine-tuned model
+python evaluate.py --model_type genie --checkpoint_dir data/genie_finetuned/final_checkpt
+```
+
+
 ## Additional Challenge Details
 
 1. We've provided `magvit2.ckpt` in the dataset download, which are the weights for a [MAGVIT2](https://github.com/TencentARC/Open-MAGVIT2) encoder/decoder. The encoder allows you to tokenize external data to try to improve the metric.

@@ -61,6 +61,10 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         self.out_x_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
 
         self.config = config
+        
+        # Apply backbone freezing if specified
+        if hasattr(config, 'freeze_backbone') and config.freeze_backbone:
+            self._freeze_backbone()
 
     def generate(
         self,
@@ -277,6 +281,34 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         relevant_loss, relevant_acc = self.compute_loss_and_acc(logits_CTHW, labels, relevant_mask)
 
         return ModelOutput(loss=relevant_loss, acc=relevant_acc, logits=logits_CTHW)
+
+    def _freeze_backbone(self):
+        """
+        Freeze the backbone transformer for transfer learning.
+        Keeps only embeddings and output projection trainable.
+        """
+        print("Freezing GENIE backbone (STTransformerDecoder)...")
+        
+        # Freeze the main transformer decoder
+        for param in self.decoder.parameters():
+            param.requires_grad = False
+        
+        # Freeze positional embeddings
+        self.pos_embed_TSC.requires_grad = False
+        
+        # Keep embeddings and output projection trainable
+        for param in self.token_embed.parameters():
+            param.requires_grad = True
+        for param in self.out_x_proj.parameters():
+            param.requires_grad = True
+            
+        # Print parameter counts
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
+        
+        print(f"Backbone frozen: {frozen_params:,} parameters")
+        print(f"Trainable: {trainable_params:,} parameters ({100 * trainable_params / total_params:.1f}%)")
 
     def init_weights(self):
         """ Works with and without muP. """

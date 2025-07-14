@@ -442,17 +442,30 @@ def main():
             logger.warning("mu_transfer not supported for V-JEPA models, ignoring flag")
 
     # Optimizer. Split weights in two groups, one with weight decay and the other not.
+    # Only include trainable parameters (important for backbone freezing)
     no_decay = ["bias", "layer_norm.weight"]
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad],
             "weight_decay": 0.0,
         },
     ]
+    
+    # Print parameter counts for backbone freezing
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if trainable_params < total_params:
+        frozen_params = total_params - trainable_params
+        logger.info(f"Training with backbone freezing:")
+        logger.info(f"  Total parameters: {total_params:,}")
+        logger.info(f"  Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.1f}%)")
+        logger.info(f"  Frozen parameters: {frozen_params:,} ({100 * frozen_params / total_params:.1f}%)")
+    else:
+        logger.info(f"Training all {total_params:,} parameters")
 
     opt_class = mup.MuAdamW if args.mu_transfer else torch.optim.AdamW
     optimizer = opt_class(optimizer_grouped_parameters, lr=args.learning_rate,

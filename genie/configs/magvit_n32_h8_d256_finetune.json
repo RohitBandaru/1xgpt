@@ -14,5 +14,5 @@
     "mlp_ratio": 4.0,
     "mlp_drop": 0.0,
     "mlp_bias": true,
-    "freeze_backbone": false
+    "freeze_backbone": true
 }
