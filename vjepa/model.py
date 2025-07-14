@@ -108,22 +108,55 @@ class VJEPAWorldModel(PreTrainedModel):
         
     def _load_vjepa_backbone(self):
         """Load pretrained V-JEPA2-AC encoder and predictor"""
-        # Load V-JEPA2-AC via PyTorch Hub (as per README instructions)
-        print("Loading V-JEPA2-AC backbone via PyTorch Hub...")
-        print(f"Pretrained: {self.config.pretrained}")
-        
-        # Load V-JEPA2-AC without conflicting parameters
-        self.encoder, self.predictor = torch.hub.load(
-            'facebookresearch/vjepa2', 
-            'vjepa2_ac_vit_giant', 
-            pretrained=self.config.pretrained,
-            verbose=False
-        )
-        
-        print(f"Loaded V-JEPA2-AC ViT-Giant:")
-        print(f"  Encoder embed_dim: {self.encoder.embed_dim}")
-        print(f"  Encoder depth: {getattr(self.encoder, 'depth', 'N/A')}")
-        print(f"  Encoder num_heads: {getattr(self.encoder, 'num_heads', 'N/A')}")
+        if self.config.pretrained:
+            # Load V-JEPA2-AC via PyTorch Hub (as per README instructions)
+            print("Loading V-JEPA2-AC backbone via PyTorch Hub...")
+            print(f"Pretrained: {self.config.pretrained}")
+            
+            # Load V-JEPA2-AC without conflicting parameters
+            self.encoder, self.predictor = torch.hub.load(
+                'facebookresearch/vjepa2', 
+                'vjepa2_ac_vit_giant', 
+                pretrained=self.config.pretrained,
+                verbose=False
+            )
+            
+            print(f"Loaded V-JEPA2-AC ViT-Giant:")
+            print(f"  Encoder embed_dim: {self.encoder.embed_dim}")
+            print(f"  Encoder depth: {getattr(self.encoder, 'depth', 'N/A')}")
+            print(f"  Encoder num_heads: {getattr(self.encoder, 'num_heads', 'N/A')}")
+        else:
+            # Create placeholder encoder and predictor for testing/development
+            print("Creating placeholder V-JEPA backbone (pretrained=False)")
+            
+            class PlaceholderEncoder(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.embed_dim = 1408  # ViT-Giant embed_dim
+                    self.depth = 40
+                    self.num_heads = 16
+                    # Simple placeholder that just processes tokens
+                    self.linear = nn.Linear(self.embed_dim, self.embed_dim)
+                    
+                def forward(self, x):
+                    return self.linear(x)
+            
+            class PlaceholderPredictor(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.embed_dim = 1408
+                    self.linear = nn.Linear(self.embed_dim, self.embed_dim)
+                    
+                def forward(self, x, action_embeds=None, states=None):
+                    return self.linear(x)
+            
+            self.encoder = PlaceholderEncoder()
+            self.predictor = PlaceholderPredictor()
+            
+            print(f"Created placeholder V-JEPA backbone:")
+            print(f"  Encoder embed_dim: {self.encoder.embed_dim}")
+            print(f"  Encoder depth: {self.encoder.depth}")
+            print(f"  Encoder num_heads: {self.encoder.num_heads}")
     
     def _init_new_weights(self):
         """Initialize newly added components"""
@@ -251,11 +284,8 @@ class VJEPAWorldModel(PreTrainedModel):
             logits_1_THW = logits_1.view(B, T, H, W, -1)[:, 1:]  # [B, T-1, H, W, 512]
             logits_2_THW = logits_2.view(B, T, H, W, -1)[:, 1:]  # [B, T-1, H, W, 512]
             
-            # Stack factorized logits like GENIE: [B, 2, T-1, H, W, 512]
-            factored_logits = torch.stack([logits_1_THW, logits_2_THW], dim=1)
-            
-            # Cross-entropy loss with reduction="none" then sum across vocabs (like GENIE)
-            # Process each factorized vocabulary separately
+            # SIMPLIFIED: Follow GENIE's approach exactly but with simpler tensor manipulation
+            # Process each factorized vocabulary separately (like before), then sum
             loss_1 = F.cross_entropy(
                 logits_1_THW.reshape(-1, 512),  # [B*(T-1)*H*W, 512] 
                 factored_labels_no_first[:, 0].reshape(-1),  # [B*(T-1)*H*W]
@@ -268,7 +298,7 @@ class VJEPAWorldModel(PreTrainedModel):
                 reduction="none"
             ).view(B, T-1, H, W)  # [B, T-1, H, W]
             
-            # Sum losses across factorized vocabs (like GENIE)
+            # Sum losses across factorized vocabs (equivalent to GENIE's .sum(dim=1))
             loss_THW = loss_1 + loss_2  # [B, T-1, H, W]
             
             # Compute mean loss over masked positions only (like GENIE)
@@ -279,13 +309,13 @@ class VJEPAWorldModel(PreTrainedModel):
             else:
                 token_loss = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
             
-            # Accuracy computation (aligned with GENIE): exact match across ALL factorized vocabs
-            pred_1_THW = logits_1_THW.argmax(dim=-1)  # [B, T-1, H, W]
-            pred_2_THW = logits_2_THW.argmax(dim=-1)  # [B, T-1, H, W]
+            # Accuracy computation exactly like GENIE: require ALL factorized vocabs to be correct
+            pred_1 = logits_1_THW.argmax(dim=-1)  # [B, T-1, H, W] - predictions for vocab 1
+            pred_2 = logits_2_THW.argmax(dim=-1)  # [B, T-1, H, W] - predictions for vocab 2
             
-            # GENIE accuracy: exact match across all factorized vocabularies
-            acc_THW = ((pred_1_THW == factored_labels_no_first[:, 0]) & 
-                       (pred_2_THW == factored_labels_no_first[:, 1]))  # [B, T-1, H, W]
+            # GENIE's .all(dim=1) logic: ALL factorized vocabs must be correct
+            acc_THW = ((pred_1 == factored_labels_no_first[:, 0]) & 
+                       (pred_2 == factored_labels_no_first[:, 1]))  # [B, T-1, H, W]
             
             # Mean accuracy over masked positions only (like GENIE)
             if num_masked_tokens > 0:
@@ -306,70 +336,77 @@ class VJEPAWorldModel(PreTrainedModel):
     def generate(
         self, 
         input_ids: torch.LongTensor,
+        attention_mask: torch.LongTensor = None,
         action_tokens: Optional[torch.LongTensor] = None,
         max_new_tokens: int = 256,
+        min_new_tokens: int = None,
         temperature: float = 0.0,
+        return_logits: bool = False,
         **kwargs
     ) -> torch.LongTensor:
-        """Generate future tokens autoregressively using factorized token prediction
+        """Generate future tokens frame-by-frame using V-JEPA predictions
+        
+        Follows GENIE's generation interface for compatibility with evaluation pipeline.
         
         Args:
             input_ids: [B, T*H*W] flattened image tokens for context frames
+            attention_mask: Ignored (for compatibility with GENIE interface)
             action_tokens: [B, T_new] scalar action tokens for generation steps
             max_new_tokens: Number of new tokens to generate (must be multiple of S)
+            min_new_tokens: If specified, must equal max_new_tokens (for compatibility)
             temperature: Sampling temperature (0.0 for greedy)
+            return_logits: Whether to return logits (for compatibility)
             
         Returns:
             generated_tokens: [B, (T + T_new)*H*W] input + generated tokens
         """
+        assert min_new_tokens in (None, max_new_tokens), \
+            "Expecting `min_new_tokens`, if specified, to match `max_new_tokens`."
+        
         assert max_new_tokens % self.config.S == 0, "max_new_tokens must be multiple of S"
         num_new_frames = max_new_tokens // self.config.S
         
         B, seq_len = input_ids.shape
-        T, H, W = self.config.T, int(self.config.S**0.5), int(self.config.S**0.5)
+        H, W = int(self.config.S**0.5), int(self.config.S**0.5)
         
         # Reshape input to spatial-temporal format
-        current_tokens = input_ids.view(B, T, H, W)
+        inputs_THW = input_ids.view(B, -1, H, W)  # [B, T_prompt, H, W]
         
-        # Generate frames autoregressively
+        # Create full sequence with masked future frames (like GENIE)
+        mask_token_id = self.config.image_vocab_size
+        masked_future = torch.full(
+            (B, num_new_frames, H, W),
+            mask_token_id, 
+            dtype=torch.long, 
+            device=input_ids.device
+        )
+        full_sequence = torch.cat([inputs_THW, masked_future], dim=1)  # [B, T_total, H, W]
+        
+        # Generate frames one by one
+        all_logits = []
         for frame_idx in range(num_new_frames):
-            # Prepare action for this frame if provided
-            current_action = None
-            if action_tokens is not None:
-                if frame_idx < action_tokens.size(1):
-                    current_action = action_tokens[:, frame_idx:frame_idx+1]
+            timestep = inputs_THW.size(1) + frame_idx
             
-            # Run forward pass to get predictions for next frame
             with torch.no_grad():
-                # Flatten current tokens for forward pass
-                current_flat = current_tokens.view(B, -1)
+                # Forward pass on full sequence with masked future
+                sequence_flat = full_sequence.view(B, -1)
+                outputs = self.forward(input_ids=sequence_flat, action_tokens=action_tokens)
                 
-                # Forward pass
-                outputs = self.forward(
-                    input_ids=current_flat,
-                    action_tokens=current_action
-                )
+                # Extract logits for current frame
+                logits = outputs.logits  # [B, 2, T*H*W, 512]
                 
-                # Get logits for the last spatial positions (next frame)
-                logits = outputs.logits  # [B, 2, (T*H*W), 512]
+                # Get logits for the frame we're generating
+                frame_start = timestep * H * W
+                frame_end = frame_start + H * W
+                frame_logits = logits[:, :, frame_start:frame_end, :]  # [B, 2, H*W, 512]
                 
-                # Extract logits for next frame positions
-                next_frame_start = (T + frame_idx) * H * W
-                next_frame_end = next_frame_start + H * W
-                
-                if next_frame_end <= logits.size(2):
-                    next_frame_logits = logits[:, :, next_frame_start:next_frame_end, :]  # [B, 2, H*W, 512]
-                else:
-                    # Predict using last frame's representation
-                    last_frame_logits = logits[:, :, -H*W:, :]  # [B, 2, H*W, 512]
-                    next_frame_logits = last_frame_logits
-                
-                # Sample from factorized distributions
+                # Sample from factorized distributions (follow GENIE's approach exactly)
                 next_frame_tokens = torch.zeros(B, H, W, dtype=torch.long, device=input_ids.device)
                 
-                # Sample each factor
-                for factor_idx in range(2):  # num_factored_vocabs = 2
-                    factor_logits = next_frame_logits[:, factor_idx]  # [B, H*W, 512]
+                # Process vocabularies in REVERSE order like GENIE (flip the factor indices)
+                # GENIE uses .flip(2).unbind(2) which processes from highest to lowest order
+                for factor_idx in reversed(range(self.config.num_factored_vocabs)):
+                    factor_logits = frame_logits[:, factor_idx]  # [B, H*W, 512]
                     
                     if temperature <= 1e-8:
                         # Greedy sampling
@@ -380,24 +417,30 @@ class VJEPAWorldModel(PreTrainedModel):
                         dist = torch.distributions.categorical.Categorical(probs=probs)
                         factor_tokens = dist.sample()  # [B, H*W]
                     
-                    # Reshape to spatial
+                    # Reshape to spatial and combine factors exactly like GENIE
                     factor_tokens_hw = factor_tokens.view(B, H, W)
                     
-                    # Combine factors: token = factor1 * vocab_size + factor2
-                    if factor_idx == 0:
-                        next_frame_tokens = factor_tokens_hw * self.config.factored_vocab_size
-                    else:
-                        next_frame_tokens += factor_tokens_hw
+                    # GENIE's combination: samples_HW *= vocab_size; samples_HW += sample
+                    next_frame_tokens *= self.config.factored_vocab_size
+                    next_frame_tokens += factor_tokens_hw
                 
-                # Append new frame to sequence
-                current_tokens = torch.cat([
-                    current_tokens,
-                    next_frame_tokens.unsqueeze(1)
-                ], dim=1)
+                # Update the sequence with generated frame
+                full_sequence[:, timestep] = next_frame_tokens
                 
-                # Update T for next iteration
-                T += 1
+                if return_logits:
+                    # Store logits in GENIE-compatible format
+                    # frame_logits is [B, 2, H*W, 512], need to rearrange to [B, 512, 2, H, W]
+                    frame_logits_reshaped = frame_logits.permute(0, 3, 1, 2).view(
+                        B, self.config.factored_vocab_size, self.config.num_factored_vocabs, H, W
+                    )
+                    all_logits.append(frame_logits_reshaped)
         
-        # Return flattened tokens
-        return current_tokens.view(B, -1)
+        # Return in GENIE-compatible format
+        predicted_tokens = full_sequence.view(B, -1)
+        
+        if return_logits:
+            stacked_logits = torch.stack(all_logits, dim=3)  # [B, vocab_size, num_vocabs, num_frames, H, W]
+            return predicted_tokens, stacked_logits
+        else:
+            return predicted_tokens
 

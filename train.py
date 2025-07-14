@@ -152,13 +152,13 @@ def parse_args():
     parser.add_argument(
         "--eval_every_n_steps",
         type=int,
-        default=10000,
+        default=1000,
         help="Eval every N training steps.",
     )
     parser.add_argument(
         "--vis_every_n_steps",
         type=int,
-        default=100000,
+        default=1000,
         help="Visualize every N training steps.",
     )
     parser.add_argument(
