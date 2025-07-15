@@ -1,0 +1,13 @@
+{
+  "_description": "V-JEPA Encoder configuration for generating continuous embeddings",
+  "_usage": "Use this config to create VJEPAEncoder for embedding generation",
+  
+  "model_name": "vit_ac_giant",
+  "img_size": 256,
+  "patch_size": 16,
+  "tubelet_size": 2,
+  "num_frames": 16,
+  "pretrained": true,
+  
+  "vjepa_embed_dim": 1408
+}

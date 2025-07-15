@@ -4,8 +4,8 @@ from transformers import PretrainedConfig
 # from typing import Optional
 
 
-class VJEPAConfig(PretrainedConfig):
-    """Configuration for V-JEPA2-AC based world model"""
+class VJEPAEncoderConfig(PretrainedConfig):
+    """Configuration for V-JEPA Encoder (ViT-G backbone for continuous embeddings)"""
     
     def __init__(
         self,
@@ -17,7 +17,36 @@ class VJEPAConfig(PretrainedConfig):
         num_frames: int = 16,
         pretrained: bool = True,
         
-        # Predictor config (from V-JEPA2-AC)
+        # Output config
+        vjepa_embed_dim: int = 1408,  # ViT-G embedding dimension
+        
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        
+        # V-JEPA2 backbone config
+        self.model_name = model_name
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.tubelet_size = tubelet_size
+        self.num_frames = num_frames
+        self.pretrained = pretrained
+        
+        # Output config
+        self.vjepa_embed_dim = vjepa_embed_dim
+    
+    def shallow_copy(self):
+        return VJEPAEncoderConfig(**self.to_dict())
+
+
+class VJEPAPredictorConfig(PretrainedConfig):
+    """Configuration for V-JEPA Predictor"""
+    
+    def __init__(
+        self,
+        # V-JEPA2 predictor config
+        model_name: str = "vit_ac_giant",
+        pretrained: bool = True,
         pred_depth: int = 24,
         pred_num_heads: int = 16,
         pred_embed_dim: int = 1024,
@@ -28,6 +57,10 @@ class VJEPAConfig(PretrainedConfig):
         T: int = 16,  # temporal sequence length (frames)
         S: int = 256,  # spatial sequence length (16x16 = 256)
         image_vocab_size: int = 262144,  # 2^18 MAGVIT2 vocab
+        
+        # Input mode config
+        input_mode: str = "discrete",  # "discrete" (COSMOS tokens) or "continuous" (V-JEPA embeddings)
+        vjepa_embed_dim: int = 1408,  # ViT-G embedding dimension (for continuous mode)
         
         # Factorization config (same as GENIE)
         num_factored_vocabs: int = 2,
@@ -52,15 +85,9 @@ class VJEPAConfig(PretrainedConfig):
     ):
         super().__init__(**kwargs)
         
-        # V-JEPA2 backbone config
+        # V-JEPA2 predictor config
         self.model_name = model_name
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.tubelet_size = tubelet_size
-        self.num_frames = num_frames
         self.pretrained = pretrained
-        
-        # Predictor config (from V-JEPA2-AC)
         self.pred_depth = pred_depth
         self.pred_num_heads = pred_num_heads
         self.pred_embed_dim = pred_embed_dim
@@ -71,6 +98,10 @@ class VJEPAConfig(PretrainedConfig):
         self.T = T
         self.S = S
         self.image_vocab_size = image_vocab_size
+        
+        # Input mode config
+        self.input_mode = input_mode
+        self.vjepa_embed_dim = vjepa_embed_dim
         
         # Factorization config (same as GENIE)
         self.num_factored_vocabs = num_factored_vocabs
@@ -92,4 +123,8 @@ class VJEPAConfig(PretrainedConfig):
         self.num_prompt_frames = num_prompt_frames
     
     def shallow_copy(self):
-        return VJEPAConfig(**self.to_dict())
+        return VJEPAPredictorConfig(**self.to_dict())
+
+
+# Legacy alias for backward compatibility
+VJEPAConfig = VJEPAPredictorConfig

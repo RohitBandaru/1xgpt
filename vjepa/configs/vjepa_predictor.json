@@ -1,11 +1,9 @@
 {
-  "model_name": "vit_ac_giant",
-  "img_size": 256,
-  "patch_size": 16,
-  "tubelet_size": 2,
-  "num_frames": 16,
-  "pretrained": true,
+  "_description": "V-JEPA Predictor configuration for continuous V-JEPA embeddings",
+  "_usage": "Use this config to train VJEPAPredictor with continuous embeddings from VJEPAEncoder",
   
+  "model_name": "vit_ac_giant",
+  "pretrained": true,
   "pred_depth": 24,
   "pred_num_heads": 16,
   "pred_embed_dim": 1024,
@@ -16,6 +14,9 @@
   "S": 256,
   "image_vocab_size": 262144,
   
+  "input_mode": "continuous",
+  "vjepa_embed_dim": 1408,
+  
   "num_factored_vocabs": 2,
   "factored_vocab_size": 512,
   
@@ -25,5 +26,9 @@
   "loss_type": "cross_entropy",
   "l1_loss_weight": 1.0,
   "token_loss_weight": 1.0,
-  "freeze_backbone": true
+  "freeze_backbone": true,
+  
+  "max_corrupt_rate": 0.2,
+  "non_mlm_ratio": 0.5,
+  "num_prompt_frames": 8
 }
