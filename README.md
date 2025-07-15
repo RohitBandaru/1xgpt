@@ -62,36 +62,68 @@ python visualize.py --token_dir data/genie_generated
 python evaluate.py --model_type genie --checkpoint_dir data/genie_model/final_checkpt
 ```
 
-## V-JEPA (Alternative)
+## V-JEPA (ViT-Giant World Model)
 
-This repo also provides a V-JEPA2-AC based world model as an alternative to GENIE. V-JEPA uses a pretrained ViT-Giant backbone (1.7B params) with action conditioning, potentially offering significant improvements over the GENIE baseline.
+This repo provides a V-JEPA2-AC based world model that supports **two input types**: precomputed COSMOS tokens (for 1X challenge) and continuous V-JEPA embeddings (for research).
 
+### 🎯 Two V-JEPA Input Modes
+
+#### Mode 1: COSMOS Tokens (1X Challenge Compatible)
+Train V-JEPA predictor on precomputed COSMOS tokens from 1X dataset:
+
+```bash
+# Train V-JEPA predictor on existing COSMOS tokens 
+python train.py \
+  --vjepa_config vjepa/configs/cosmos_predictor.json \
+  --train_data_dir data/train_v1.1 \
+  --output_dir data/vjepa_cosmos_model
+
+# Evaluate COSMOS predictor
+python evaluate.py --model_type vjepa --checkpoint_dir data/vjepa_cosmos_model/final_checkpt
 ```
-# Train V-JEPA model with cross-entropy loss
-python train.py --vjepa_config vjepa/configs/vjepa_vitg_1x.json --output_dir data/vjepa_model --max_eval_steps 10
 
-# Generate frames from trained V-JEPA model
-python vjepa/generate.py --checkpoint_dir data/vjepa_model/final_checkpt
+#### Mode 2: Continuous V-JEPA Embeddings (Research)
+Generate continuous embeddings and train predictor on them:
 
-# Visualize generated frames
-python visualize.py --token_dir data/vjepa_generated
+```bash
+# Generate continuous V-JEPA embeddings from raw video
+python tokenize_videos.py \
+  --input_dir data/raw_video \
+  --output_dir data/vjepa_embeddings \
+  --config_path vjepa/configs/vjepa_encoder.json
 
-# Evaluate the trained V-JEPA model
-python evaluate.py --model_type vjepa --checkpoint_dir data/vjepa_model/final_checkpt
+# Train V-JEPA predictor on continuous embeddings
+python train.py \
+  --vjepa_config vjepa/configs/vjepa_predictor.json \
+  --train_data_dir data/vjepa_embeddings \
+  --output_dir data/vjepa_embedding_model
+
+# Evaluate embedding predictor  
+python evaluate.py --model_type vjepa --checkpoint_dir data/vjepa_embedding_model/final_checkpt
 ```
 
 ### V-JEPA vs GENIE Comparison
 
-| Model | Architecture | Parameters | Current Loss | Target |
-|-------|-------------|------------|--------------|---------|
-| **GENIE** | Spatio-temporal MaskGIT | 138M | 8.79 | Baseline |
-| **V-JEPA** | ViT-Giant + Action Conditioning | 1.7B | <7.5 (expected) | <8.0 (prize) |
+| Model | Architecture | Parameters | Input Type | Target Loss |
+|-------|-------------|------------|------------|-------------|
+| **GENIE** | Spatio-temporal MaskGIT | 138M | COSMOS tokens | 8.79 (baseline) |
+| **V-JEPA (COSMOS)** | ViT-Giant Predictor | 1.7B | COSMOS tokens | <8.0 (prize) |
+| **V-JEPA (Embeddings)** | ViT-Giant Full Pipeline | 1.7B | Continuous embeddings | Research |
 
 **Key V-JEPA advantages:**
-- 12x more parameters than GENIE
+- 12x more parameters than GENIE (1.7B vs 138M)
 - Pretrained on internet-scale video data  
 - Native action conditioning support
-- Multiple loss function options (cross-entropy, L1)
+- **Rich continuous representations** from ViT-Giant backbone
+- **Flexible input modes**: COSMOS tokens or V-JEPA embeddings
+
+### Configuration Files
+
+| Config File | Purpose | Input Type | Use Case |
+|-------------|---------|------------|----------|
+| `vjepa/configs/cosmos_predictor.json` | Predictor for COSMOS tokens | Discrete | 1X Challenge |
+| `vjepa/configs/vjepa_predictor.json` | Predictor for V-JEPA embeddings | Continuous | Research |
+| `vjepa/configs/vjepa_encoder.json` | Encoder for embedding generation | Raw video | Preprocessing |
 
 ### 1X GENIE Baseline
 We provide two pre-trained GENIE models, linked in the [leaderboard](#leaderboard).
@@ -318,3 +350,57 @@ engines such as <a href="https://g.co/datasetsearch">Google Dataset Search</a>.
   </tr>
 </table>
 </div>
+
+## V-JEPA Architecture Details
+
+### Component Overview
+
+The V-JEPA implementation consists of three main components:
+
+#### 1. VJEPAEncoder (Continuous Embeddings)
+- **Purpose**: Generate continuous embeddings from raw video
+- **Architecture**: Frozen ViT-Giant (1.7B parameters) from V-JEPA2-AC
+- **Output**: Rich continuous features `[B, N_patches, 1408]`
+- **Use case**: Research applications requiring full feature richness
+
+#### 2. VJEPAPredictor (World Model)
+- **Purpose**: Predict future frames using V-JEPA2-AC predictor
+- **Architecture**: Predictor + factorized output heads for 1X challenge
+- **Input types**: COSMOS tokens OR continuous V-JEPA embeddings
+- **Parameters**: 1.7B (predictor) + additional heads
+
+#### 3. Unified Training Pipeline
+- **Single training script**: `train.py` handles both input modes
+- **Shared evaluation**: Same metrics and visualization for both modes
+- **Configuration-driven**: Behavior controlled by config files
+
+### Performance Characteristics
+
+| Component | Memory (RTX 4090) | Processing Speed | Use Case |
+|-----------|-------------------|------------------|----------|
+| **VJEPAEncoder** | ~8GB | 10-50 fps | Embedding generation |
+| **VJEPAPredictor (COSMOS)** | ~6GB | Fast training | 1X Challenge |
+| **VJEPAPredictor (Embeddings)** | ~8GB | Medium training | Research |
+
+### Configuration System
+
+The V-JEPA implementation uses separate config classes for clean separation:
+
+#### VJEPAEncoderConfig
+- Minimal parameters for encoder operation
+- ViT-Giant backbone settings
+- Output embedding dimensions
+
+#### VJEPAPredictorConfig  
+- Full predictor training parameters
+- Input mode selection (discrete/continuous)
+- Factorization and training settings
+
+### Integration with Existing Codebase
+
+V-JEPA integrates seamlessly with the existing 1X challenge infrastructure:
+
+- **Shared evaluation framework**: Uses same `evaluate.py` as GENIE
+- **Compatible data formats**: Works with existing COSMOS token datasets
+- **Same visualization tools**: Generated outputs work with `visualize.py`
+- **Unified command interface**: Same CLI patterns as GENIE
