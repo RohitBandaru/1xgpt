@@ -1,10 +1,18 @@
 import torch
 from torch import nn
-from xformers.ops import LowerTriangularMask, memory_efficient_attention, unbind
 import os
 
-
+# Try to import xformers, fall back gracefully if not available
 XFORMERS_DISABLED = os.environ.get("XFORMERS_DISABLED", "false").lower() == "true"
+try:
+    if not XFORMERS_DISABLED:
+        from xformers.ops import LowerTriangularMask, memory_efficient_attention, unbind
+        XFORMERS_AVAILABLE = True
+    else:
+        XFORMERS_AVAILABLE = False
+except ImportError:
+    XFORMERS_AVAILABLE = False
+    print("xformers not available, using BasicSelfAttention fallback")
 
 class BasicSelfAttention(nn.Module):
     def __init__(
@@ -61,28 +69,29 @@ class BasicSelfAttention(nn.Module):
         return x
 
 
-class MemoryEfficientAttention(BasicSelfAttention):
-    # NOTE: Mem-eff attention from xformers is actually Flash Attention 2
-        
-    def forward(self, x: torch.Tensor, causal: bool = False) -> torch.Tensor:
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
-        q, k, v = unbind(qkv, 2)
-        if self.qk_norm:
-            q = self.norm(q)
-            k = self.norm(k)
-            # LN done in float32, cast back to bf16
-            q = q.to(dtype=v.dtype)
-            k = k.to(dtype=v.dtype)
+# Only define MemoryEfficientAttention if xformers is available
+if XFORMERS_AVAILABLE:
+    class MemoryEfficientAttention(BasicSelfAttention):
+        # NOTE: Mem-eff attention from xformers is actually Flash Attention 2
+            
+        def forward(self, x: torch.Tensor, causal: bool = False) -> torch.Tensor:
+            B, N, C = x.shape
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+            q, k, v = unbind(qkv, 2)
+            if self.qk_norm:
+                q = self.norm(q)
+                k = self.norm(k)
+                # LN done in float32, cast back to bf16
+                q = q.to(dtype=v.dtype)
+                k = k.to(dtype=v.dtype)
 
-        attn_bias = LowerTriangularMask() if causal else None
-        x = memory_efficient_attention(q, k, v, attn_bias=attn_bias, scale=self.scale)
-        x = x.reshape([B, N, C])
+            attn_bias = LowerTriangularMask() if causal else None
+            x = memory_efficient_attention(q, k, v, attn_bias=attn_bias, scale=self.scale)
+            x = x.reshape([B, N, C])
 
-        x = self.proj(x)
-        return x
+            x = self.proj(x)
+            return x
 
-if XFORMERS_DISABLED:
-    SelfAttention = BasicSelfAttention
-else:
     SelfAttention = MemoryEfficientAttention
+else:
+    SelfAttention = BasicSelfAttention
