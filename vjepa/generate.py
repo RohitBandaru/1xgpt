@@ -19,7 +19,7 @@ from transformers import default_data_collator
 # 1xgpt imports
 sys.path.append(os.getcwd())
 from data import RawTokenDataset
-from vjepa.model import VJEPAWorldModel
+from vjepa.predictor import VJEPAPredictor
 
 
 def parse_args():
@@ -63,41 +63,78 @@ class VJEPAGenerator:
         self.device = device
         
         # Load V-JEPA model
-        self.model = VJEPAWorldModel.from_pretrained(checkpoint_dir)
+        self.model = VJEPAPredictor.from_pretrained(checkpoint_dir)
         self.model = self.model.to(device)
         self.model.eval()
         
-    def generate_frames(self, input_ids: torch.LongTensor, action_tokens=None) -> torch.LongTensor:
+    def generate_frames(self, input_ids: torch.LongTensor, num_prompt_frames: int = 8, 
+                       teacher_force_time: bool = False, action_tokens=None) -> torch.LongTensor:
         """
-        Generate future frames autoregressively.
+        Generate future frames to match GENIE's generation interface.
         
         Args:
             input_ids: [B, T*H*W] input token sequence
+            num_prompt_frames: Number of context frames
+            teacher_force_time: Whether to use teacher forcing
             action_tokens: [B, T] action tokens (optional)
             
         Returns:
             generated_tokens: [B, T, H, W] generated frame tokens
         """
+        from einops import rearrange
+        
+        B = input_ids.shape[0]
+        T = 16  # Fixed for 1X challenge  
+        H = W = 16  # Fixed spatial dimensions for 256 tokens (16x16)
+        
+        # Reshape to spatial-temporal format
+        example_THW = rearrange(input_ids, "b (t h w) -> b t h w", t=T, h=H, w=W)
+        
+        samples = []
+        prompt_THW = example_THW.clone()
+        
         with torch.no_grad():
-            # TODO: Implement autoregressive generation
-            # For now, just run forward pass
-            outputs = self.model(input_ids, action_tokens)
+            for timestep in range(num_prompt_frames, T):
+                if teacher_force_time:
+                    # Use ground truth up to current timestep
+                    prompt_THW = example_THW.clone()
+                
+                # Get context up to current timestep
+                context_frames = prompt_THW[:, :timestep]
+                context_flat = rearrange(context_frames, "b t h w -> b (t h w)")
+                
+                # Forward pass to predict next frame
+                outputs = self.model(context_flat, action_tokens)
+                
+                # Get logits for last predicted frame
+                logits_1, logits_2 = outputs.logits[:, 0], outputs.logits[:, 1]
+                
+                # Extract logits for the frame being predicted
+                N_context = context_flat.shape[1]
+                last_frame_start = N_context - H * W
+                frame_logits_1 = logits_1[:, last_frame_start:last_frame_start + H*W]
+                frame_logits_2 = logits_2[:, last_frame_start:last_frame_start + H*W]
+                
+                # Sample next frame
+                pred_tokens_1 = torch.argmax(frame_logits_1, dim=-1).view(B, H, W)
+                pred_tokens_2 = torch.argmax(frame_logits_2, dim=-1).view(B, H, W)
+                
+                # Reconstruct full tokens
+                from genie.factorization_utils import unfactorize_token_ids
+                factored_pred = torch.stack([pred_tokens_1, pred_tokens_2], dim=-1)
+                samples_HW = unfactorize_token_ids(factored_pred, 2, 512)
+                
+                samples.append(samples_HW)
+                
+                if not teacher_force_time:
+                    # Autoregressive: use prediction for next timestep
+                    prompt_THW[:, timestep] = samples_HW
             
-            # Convert logits to tokens
-            logits_1, logits_2 = outputs.logits[:, 0], outputs.logits[:, 1]
-            tokens_1 = torch.argmax(logits_1, dim=-1)
-            tokens_2 = torch.argmax(logits_2, dim=-1)
+            # Combine prompt frames with generated frames
+            generated_frames = torch.stack(samples, dim=1)  # [B, T-num_prompt_frames, H, W]
+            full_sequence = torch.cat([example_THW[:, :num_prompt_frames], generated_frames], dim=1)
             
-            # Reconstruct tokens from factorized representation
-            from genie.factorization_utils import unfactorize_token_ids
-            B, N = tokens_1.shape
-            T, H, W = 16, 16, 16  # TODO: Get from config
-            
-            factored_tokens = torch.stack([tokens_1, tokens_2], dim=-1)  # [B, N, 2]
-            generated_tokens = unfactorize_token_ids(factored_tokens, 2, 512)  # [B, N]
-            generated_tokens = generated_tokens.view(B, T, H, W)
-            
-            return generated_tokens
+            return full_sequence
 
 
 def main():
