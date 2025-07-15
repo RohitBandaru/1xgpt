@@ -3,11 +3,15 @@ import math
 import os
 import random
 from pathlib import Path
+from typing import Optional, Union
 
 import numpy as np
 import torch
+import torchvision.transforms as transforms
 from einops import rearrange
 from torch.utils.data import Dataset as TorchDataset
+import cv2
+from PIL import Image
 
 from genie.factorization_utils import factorize_token_ids, unfactorize_token_ids
 from genie.config import GenieConfig
@@ -166,4 +170,190 @@ def get_maskgit_collator(config: GenieConfig):
             "labels": rearrange(labels, "b t h w -> b (t h w)"),
         }
 
+    return collate_fn
+
+
+class RawVideoDataset(TorchDataset):
+    """Loads raw MP4 video files and converts them to tensors for VJEPA training"""
+    
+    def __init__(
+        self,
+        data_dir: Union[str, Path],
+        window_size: int,
+        stride: int = 1,
+        filter_interrupts: bool = True,
+        filter_overlaps: bool = False,
+        image_size: int = 256,  # Target image size for V-JEPA
+        fps: Optional[int] = None  # If None, use original FPS
+    ):
+        """
+        Args:
+            data_dir: directory containing video_{shard}.mp4 files and metadata_{shard}.json
+            window_size: number of frames per sequence
+            stride: frame skip
+            filter_interrupts: filter out sequences that span multiple segments
+            filter_overlaps: filter out overlapping sequences
+            image_size: resize frames to this size (V-JEPA typically uses 224 or 256)
+            fps: target fps, if None uses original fps
+        """
+        data_dir = Path(data_dir)
+        self.data_dir = data_dir
+        self.window_size = window_size
+        self.stride = stride
+        self.image_size = image_size
+        self.fps = fps
+        
+        # Find all video and metadata files
+        self.video_files = sorted(data_dir.glob("video_*.mp4"))
+        self.metadata_files = sorted(data_dir.glob("metadata_*.json"))
+        self.segment_files = sorted(data_dir.glob("segment_idx_*.bin"))
+        
+        if not self.video_files:
+            raise FileNotFoundError(f"No video_*.mp4 files found in {data_dir}")
+        
+        # Load metadata for each shard
+        self.shard_metadata = []
+        for metadata_file in self.metadata_files:
+            with open(metadata_file) as f:
+                self.shard_metadata.append(json.load(f))
+        
+        # Load segment indices if available
+        self.segment_indices = []
+        if self.segment_files and filter_interrupts:
+            for segment_file in self.segment_files:
+                segments = np.fromfile(segment_file, dtype=np.int32)
+                self.segment_indices.append(segments)
+        elif filter_interrupts:
+            raise NotImplementedError("Cannot filter interrupted sequences without segment indices.")
+        
+        # Build frame index: (shard_idx, frame_idx)
+        self.frame_index = []
+        for shard_idx, video_file in enumerate(self.video_files):
+            # Get number of frames in this video
+            cap = cv2.VideoCapture(str(video_file))
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            
+            for frame_idx in range(frame_count):
+                self.frame_index.append((shard_idx, frame_idx))
+        
+        # Number of frames between first and last frame of sequence
+        self.video_len = (self.window_size - 1) * self.stride
+        
+        # Find valid starting indices
+        self.valid_start_inds = []
+        for start_idx in range(len(self.frame_index) - self.video_len):
+            start_shard, start_frame = self.frame_index[start_idx]
+            end_shard, end_frame = self.frame_index[start_idx + self.video_len]
+            
+            # Check if sequence spans multiple video files
+            if start_shard != end_shard:
+                continue
+                
+            # Check for segment interrupts if enabled
+            if filter_interrupts and self.segment_indices:
+                start_segment = self.segment_indices[start_shard][start_frame]
+                end_segment = self.segment_indices[start_shard][end_frame]
+                if start_segment != end_segment:
+                    continue
+            
+            self.valid_start_inds.append(start_idx)
+        
+        # Filter overlaps if requested
+        if filter_overlaps:
+            filtered_start_inds = []
+            for start_ind in self.valid_start_inds:
+                overlapping_start_inds = {start_ind - i * self.stride for i in range(1, self.window_size)}
+                
+                # Check if any overlapping sequence is already included
+                for existing_start_ind in filtered_start_inds[-self.window_size * self.stride:]:
+                    if existing_start_ind in overlapping_start_inds:
+                        break
+                else:
+                    filtered_start_inds.append(start_ind)
+            
+            self.valid_start_inds = filtered_start_inds
+        
+        # Image preprocessing for V-JEPA
+        self.transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ImageNet normalization
+        ])
+        
+        print(f"Loaded {len(self.video_files)} video files with {len(self.valid_start_inds)} valid sequences")
+    
+    def __len__(self):
+        return len(self.valid_start_inds)
+    
+    def __getitem__(self, idx):
+        """
+        Returns a sequence of raw video frames as tensors
+        Returns:
+            dict with:
+            - pixel_values: [T, C, H, W] tensor of video frames
+            - attention_mask: [T] tensor of ones (all frames valid)
+        """
+        start_idx = self.valid_start_inds[idx]
+        
+        # Get frame indices for this sequence
+        frame_indices = [start_idx + i * self.stride for i in range(self.window_size)]
+        
+        frames = []
+        shard_idx = None
+        cap = None
+        
+        try:
+            for frame_idx in frame_indices:
+                current_shard, current_frame = self.frame_index[frame_idx]
+                
+                # Open new video file if shard changed
+                if current_shard != shard_idx:
+                    if cap is not None:
+                        cap.release()
+                    
+                    shard_idx = current_shard
+                    video_path = self.video_files[shard_idx]
+                    cap = cv2.VideoCapture(str(video_path))
+                
+                # Seek to frame
+                cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
+                ret, frame = cap.read()
+                
+                if not ret:
+                    raise RuntimeError(f"Failed to read frame {current_frame} from {self.video_files[shard_idx]}")
+                
+                # Convert BGR to RGB
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Convert to PIL Image and apply transforms
+                pil_frame = Image.fromarray(frame)
+                tensor_frame = self.transform(pil_frame)
+                frames.append(tensor_frame)
+        
+        finally:
+            if cap is not None:
+                cap.release()
+        
+        # Stack frames: [T, C, H, W]
+        pixel_values = torch.stack(frames)
+        attention_mask = torch.ones(self.window_size)
+        
+        return {
+            "pixel_values": pixel_values,
+            "attention_mask": attention_mask,
+        }
+
+
+def get_raw_video_collator():
+    """Simple collator for raw video data"""
+    def collate_fn(features):
+        pixel_values = torch.stack([ex["pixel_values"] for ex in features])
+        attention_mask = torch.stack([ex["attention_mask"] for ex in features])
+        
+        return {
+            "pixel_values": pixel_values,  # [B, T, C, H, W]
+            "attention_mask": attention_mask,  # [B, T]
+        }
+    
     return collate_fn

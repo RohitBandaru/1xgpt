@@ -23,11 +23,11 @@ from transformers import (
     get_scheduler,
 )
 
-from data import RawTokenDataset, get_maskgit_collator
+from data import RawTokenDataset, RawVideoDataset, get_maskgit_collator, get_raw_video_collator
 from eval_utils import decode_tokens, compute_lpips
 from genie.st_mask_git import GenieConfig, STMaskGIT
 from vjepa.config import VJEPAConfig
-from vjepa.model import VJEPAWorldModel
+from vjepa.predictor import VJEPAPredictor
 # from llama.config import LlamaConfig1X
 # from llama.modeling_llama_mup import LlamaForCausalLM
 from visualize import decode_latents_wrapper
@@ -90,7 +90,13 @@ def parse_args():
         "--vjepa_config",
         type=str,
         help="VJEPAConfig json."
-    ),
+    )
+    parser.add_argument(
+        "--raw_video_data_dir",
+        type=str,
+        default="data/raw_video",
+        help="Directory containing raw video files for VJEPA (video_*.mp4, metadata_*.json, segment_idx_*.bin)"
+    )
     parser.add_argument(
         "--warmstart_path",
         type=str,
@@ -370,21 +376,41 @@ def main():
 
     accelerator.wait_for_everyone()
 
-    train_dataset = RawTokenDataset(args.train_data_dir, window_size=args.window_size,
-                                    stride=args.stride, filter_overlaps=args.filter_overlaps)
-    if not args.overfit_first_batch:
-        eval_dataset = RawTokenDataset(args.val_data_dir, window_size=args.window_size,
-                                       stride=args.stride, filter_overlaps=True)
+    # Choose dataset type based on model
+    if args.vjepa_config is not None:
+        print("Using tokenized dataset for V-JEPA predictor training")
+        # V-JEPA predictor always uses tokenized data (V-JEPA or COSMOS tokens)
+        train_dataset = RawTokenDataset(args.train_data_dir, window_size=args.window_size,
+                                        stride=args.stride, filter_overlaps=args.filter_overlaps)
+        if not args.overfit_first_batch:
+            eval_dataset = RawTokenDataset(args.val_data_dir, window_size=args.window_size,
+                                           stride=args.stride, filter_overlaps=True)
+        else:
+            train_dataset.valid_start_inds = train_dataset.valid_start_inds[:args.per_device_train_batch_size
+                                                                             * args.gradient_accumulation_steps
+                                                                             * accelerator.num_processes]
+            eval_dataset = train_dataset
+        
+        # Use metadata from tokenized dataset
+        latent_side_len, vocab_size, hz = [train_dataset.metadata[key] for key in ("s", "vocab_size", "hz")]
+        
     else:
-        train_dataset.valid_start_inds = train_dataset.valid_start_inds[:args.per_device_train_batch_size
-                                                                         * args.gradient_accumulation_steps
-                                                                         * accelerator.num_processes]
-        eval_dataset = train_dataset
+        print("Using tokenized dataset for GENIE")
+        train_dataset = RawTokenDataset(args.train_data_dir, window_size=args.window_size,
+                                        stride=args.stride, filter_overlaps=args.filter_overlaps)
+        if not args.overfit_first_batch:
+            eval_dataset = RawTokenDataset(args.val_data_dir, window_size=args.window_size,
+                                           stride=args.stride, filter_overlaps=True)
+        else:
+            train_dataset.valid_start_inds = train_dataset.valid_start_inds[:args.per_device_train_batch_size
+                                                                             * args.gradient_accumulation_steps
+                                                                             * accelerator.num_processes]
+            eval_dataset = train_dataset
 
-    assert all(train_dataset.metadata[shared_key] == eval_dataset.metadata[shared_key]
-               for shared_key in ("s", "vocab_size", "hz"))
+        assert all(train_dataset.metadata[shared_key] == eval_dataset.metadata[shared_key]
+                   for shared_key in ("s", "vocab_size", "hz"))
 
-    latent_side_len, vocab_size, hz = [train_dataset.metadata[key] for key in ("s", "vocab_size", "hz")]
+        latent_side_len, vocab_size, hz = [train_dataset.metadata[key] for key in ("s", "vocab_size", "hz")]
 
     if args.llama_config is not None:
         raise NotImplementedError("Have not factorized Llama vocabulary.")
@@ -447,7 +473,10 @@ def main():
         config.image_vocab_size = vocab_size
         config.T = args.window_size
         config.S = latent_side_len**2
-        model = VJEPAWorldModel(config)
+        
+        # V-JEPA predictor model
+        model = VJEPAPredictor(config)
+        print("Using VJEPAPredictor for token-based training")
         
         # V-JEPA doesn't support mu_transfer currently
         if args.mu_transfer:
@@ -487,7 +516,7 @@ def main():
     if args.llama_config is not None:
         collate_fn = default_data_collator
     elif args.vjepa_config is not None:
-        # V-JEPA uses same collator as GENIE (MaskGIT-style)
+        # V-JEPA predictor uses MaskGIT collator for token data
         collate_fn = get_maskgit_collator(config)
     else:  # GENIE
         collate_fn = get_maskgit_collator(config)
