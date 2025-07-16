@@ -83,26 +83,31 @@ class VJEPAPredictor(PreTrainedModel):
             config.action_vocab_size,
             config.action_embed_dim
         )
+        # V-JEPA expects 7-dim robot states, not high-dim embeddings
+        self.action_to_state = nn.Linear(config.action_embed_dim, 7)  # Convert to 7D robot state
         
         # Dual input support: COSMOS tokens OR continuous V-JEPA embeddings
         self.input_mode = getattr(config, 'input_mode', 'discrete')  # 'discrete' or 'continuous'
         
         # Always support COSMOS tokens (from 1X precomputed dataset)
+        # V-JEPA predictor expects 1408-dim embeddings (ViT-G dimension)
+        # Add +1 to vocab size to handle mask token (image_vocab_size)
         self.token_embedding = nn.Embedding(
-            config.image_vocab_size,  # COSMOS vocabulary size
-            self.predictor.embed_dim
+            config.image_vocab_size + 1,  # COSMOS vocabulary size + mask token
+            config.vjepa_embed_dim  # Use V-JEPA embed dim (1408) to match predictor
         )
         
         # Optionally support continuous V-JEPA embeddings
         if self.input_mode in ['continuous', 'hybrid']:
             vjepa_embed_dim = getattr(config, 'vjepa_embed_dim', 1408)  # ViT-G embedding dimension
-            self.continuous_proj = nn.Linear(vjepa_embed_dim, self.predictor.embed_dim)
+            self.continuous_proj = nn.Linear(vjepa_embed_dim, config.vjepa_embed_dim)
         else:
             self.continuous_proj = None
         
         # Factorized output head for 1X challenge
+        # V-JEPA predictor outputs its internal dimension, add projection if needed
         self.factorized_head = FactorizedTokenPredictor(
-            embed_dim=self.predictor.embed_dim,
+            embed_dim=config.pred_embed_dim,  # This will be the V-JEPA predictor's output dim
             factored_vocab_size=config.factored_vocab_size
         )
         
@@ -128,7 +133,6 @@ class VJEPAPredictor(PreTrainedModel):
             self.predictor = predictor
             
             print(f"✅ Loaded pretrained V-JEPA predictor:")
-            print(f"   Embed dim: {self.predictor.embed_dim}")
             print(f"   Parameters: {sum(p.numel() for p in self.predictor.parameters()):,}")
         else:
             # Load architecture without pretrained weights
@@ -141,13 +145,17 @@ class VJEPAPredictor(PreTrainedModel):
             self.predictor = predictor
             
             print(f"✅ Loaded V-JEPA predictor architecture (no pretrained weights):")
-            print(f"   Embed dim: {self.predictor.embed_dim}")
             print(f"   Parameters: {sum(p.numel() for p in self.predictor.parameters()):,}")
     
     def _init_new_weights(self):
         """Initialize newly added components"""
         # Initialize action embedding
         nn.init.normal_(self.action_embedding.action_embed.weight, std=0.02)
+        
+        # Initialize action to state projection
+        nn.init.xavier_uniform_(self.action_to_state.weight)
+        if self.action_to_state.bias is not None:
+            nn.init.zeros_(self.action_to_state.bias)
         
         # Initialize COSMOS token embedding
         nn.init.normal_(self.token_embedding.weight, std=0.02)
@@ -175,6 +183,10 @@ class VJEPAPredictor(PreTrainedModel):
         
         # Keep new components trainable
         for param in self.action_embedding.parameters():
+            param.requires_grad = True
+        
+        # Keep action projection trainable
+        for param in self.action_to_state.parameters():
             param.requires_grad = True
         
         # Keep COSMOS token embedding trainable
@@ -237,21 +249,27 @@ class VJEPAPredictor(PreTrainedModel):
             B, N, embed_dim = input_embeds.shape
             token_embeds = self.continuous_proj(input_embeds)  # [B, N, predictor_embed_dim]
         
-        # 2. Prepare action conditioning if provided
+        # 2. Prepare action conditioning - V-JEPA predictor expects 7D robot states
         if action_tokens is not None:
             action_embeds = self.action_embedding(action_tokens)  # [B, T, action_embed_dim]
+            robot_states = self.action_to_state(action_embeds)  # [B, T, 7] - 7D robot states
             
-            # Expand action embeds to match token sequence length
-            T = action_tokens.size(1)
-            N_spatial = N // T
-            action_embeds_expanded = action_embeds.unsqueeze(2).expand(-1, -1, N_spatial, -1)
-            action_embeds_flat = action_embeds_expanded.view(B, N, -1)
-            
-            # Run V-JEPA predictor with action conditioning
-            z_pred = self.predictor(token_embeds, action_embeds_flat, action_embeds_flat)
+            # V-JEPA expects states at each timestep, not expanded to spatial locations
+            # Use robot states directly for both actions and poses
+            action_states = robot_states  # [B, T, 7]
+            pose_states = robot_states    # [B, T, 7] - same as actions for simplicity
         else:
-            # No action conditioning
-            z_pred = self.predictor(token_embeds)
+            # No action conditioning - create dummy 7D robot states
+            T = self.config.T  # Use config T for temporal dimension
+            device = token_embeds.device
+            
+            # Create zero robot states with correct 7D shape
+            action_states = torch.zeros(B, T, 7, device=device)
+            pose_states = torch.zeros(B, T, 7, device=device)
+        
+        # Always call V-JEPA predictor with 3 arguments: video_representations, actions, states
+        # V-JEPA2-AC expects: (video_tokens, action_deltas, robot_states)
+        z_pred = self.predictor(token_embeds, action_states, pose_states)
         
         # 3. Convert to factorized tokens for 1X challenge
         logits_1, logits_2 = self.factorized_head(z_pred)  # [B, N, 512] each
@@ -398,18 +416,3 @@ class VJEPAPredictor(PreTrainedModel):
         self.input_mode = mode
         print(f"✅ Input mode set to: {mode}")
     
-    def get_input_info(self) -> dict:
-        """
-        Get information about supported input modes and current configuration.
-        
-        Returns:
-            info: Dict with input mode details
-        """
-        return {
-            'current_mode': self.input_mode,
-            'supports_cosmos_tokens': True,  # Always supported
-            'supports_vjepa_embeddings': self.continuous_proj is not None,
-            'predictor_embed_dim': self.predictor.embed_dim,
-            'cosmos_vocab_size': self.token_embedding.num_embeddings,
-            'vjepa_embed_dim': getattr(self.continuous_proj, 'in_features', None) if self.continuous_proj else None,
-        }
