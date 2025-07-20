@@ -10,6 +10,7 @@ import mup
 import numpy as np
 import torch
 import torchvision.transforms.functional as transforms_f
+import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
@@ -17,19 +18,21 @@ from einops import rearrange
 from lpips import lpips
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-import transformers
-from transformers import (
-    default_data_collator,
-    get_scheduler,
-)
 
-from data import RawTokenDataset, RawVideoDataset, get_maskgit_collator, get_raw_video_collator
-from eval_utils import decode_tokens, compute_lpips
+from data import (
+    RawTokenDataset,
+    VJEPAContinuousDataset,
+    get_maskgit_collator,
+    get_vjepa_continuous_collator,
+)
+from eval_utils import compute_lpips, decode_tokens
 from genie.st_mask_git import GenieConfig, STMaskGIT
-from vjepa.config import VJEPAConfig
+from vjepa.config import VJEPAPredictorConfig
 from vjepa.predictor import VJEPAPredictor
+
 # from llama.config import LlamaConfig1X
 # from llama.modeling_llama_mup import LlamaForCausalLM
+
 from visualize import decode_latents_wrapper
 
 matplotlib.use("Agg")
@@ -41,16 +44,22 @@ logger = get_logger(__name__)
 
 def parse_args():
     # parser = argparse.ArgumentParser(description="Train a MaskGIT or Llama-style LLM on video generation.")
-    parser = argparse.ArgumentParser(description="Train a spatial-temporal MaskGIT-style model on video generation.")
+    parser = argparse.ArgumentParser(
+        description="Train a spatial-temporal MaskGIT-style model on video generation."
+    )
 
     # Data
     parser.add_argument(
-        "--train_data_dir", type=str, default="data/train_v1.1",
-        help="Directory containing tokenized data, should have a `video.bin`, `metadata.json` and `segment_ids.json`."
+        "--train_data_dir",
+        type=str,
+        default="data/train_v1.1",
+        help="Directory containing tokenized data, should have a `video.bin`, `metadata.json` and `segment_ids.json`.",
     )
     parser.add_argument(
-        "--val_data_dir", type=str, default="data/val_v1.1",
-        help="Directory containing tokenized data, should have a `video.bin`, `metadata.json` and `segment_ids.json`."
+        "--val_data_dir",
+        type=str,
+        default="data/val_v1.1",
+        help="Directory containing tokenized data, should have a `video.bin`, `metadata.json` and `segment_ids.json`.",
     )
     parser.add_argument(
         "--window_size",
@@ -70,8 +79,8 @@ def parse_args():
         help=(
             "Whether to filter repeated frames in the train dataset (`filter_overlaps` always true for the val set). "
             "Filtering essentially makes the training dataset less correlated but ~16x smaller, "
-            "see the `filter_overlaps` argument in `RawTokenDataset` for details.")
-        ,
+            "see the `filter_overlaps` argument in `RawTokenDataset` for details."
+        ),
     )
 
     # Model
@@ -79,30 +88,24 @@ def parse_args():
         "--llama_config",
         type=str,
         help="`transformers.LlamaConfig` json. "
-             "E.g. https://huggingface.co/1x-technologies/Llama_1B_v0/blob/main/config.json",
+        "E.g. https://huggingface.co/1x-technologies/Llama_1B_v0/blob/main/config.json",
     )
+    parser.add_argument("--genie_config", type=str, help="GenieConfig json.")
     parser.add_argument(
-        "--genie_config",
-        type=str,
-        help="GenieConfig json."
-    )
-    parser.add_argument(
-        "--vjepa_config",
-        type=str,
-        help="VJEPAConfig json."
+        "--vjepa_predictor_config", type=str, help="VJEPAPredictorConfig json."
     )
     parser.add_argument(
         "--raw_video_data_dir",
         type=str,
         default="data/raw_video",
-        help="Directory containing raw video files for VJEPA (video_*.mp4, metadata_*.json, segment_idx_*.bin)"
+        help="Directory containing raw video files for VJEPA (video_*.mp4, metadata_*.json, segment_idx_*.bin)",
     )
     parser.add_argument(
         "--warmstart_path",
         type=str,
         default=None,
         help="A path to a checkpoint to warmstart a model from, possibly not trained on the same dataset, "
-             "will resize embeddings if needed.",
+        "will resize embeddings if needed.",
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -141,8 +144,15 @@ def parse_args():
         default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
-    parser.add_argument("--num_train_epochs", type=int, default=1, help="Total number of training epochs to perform.")
+    parser.add_argument(
+        "--weight_decay", type=float, default=0.0, help="Weight decay to use."
+    )
+    parser.add_argument(
+        "--num_train_epochs",
+        type=int,
+        default=1,
+        help="Total number of training epochs to perform.",
+    )
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -172,10 +182,21 @@ def parse_args():
         type=str,
         default="linear",
         help="The scheduler type to use.",
-        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup", "custom_cosine"],
+        choices=[
+            "linear",
+            "cosine",
+            "cosine_with_restarts",
+            "polynomial",
+            "constant",
+            "constant_with_warmup",
+            "custom_cosine",
+        ],
     )
     parser.add_argument(
-        "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
+        "--num_warmup_steps",
+        type=int,
+        default=0,
+        help="Number of steps for the warmup in the lr scheduler.",
     )
     parser.add_argument(
         "--max_grad_norm",
@@ -206,14 +227,21 @@ def parse_args():
     )
 
     # Misc
-    parser.add_argument("--output_dir", type=str, required=True, help="Where to store the model checkpoints.")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Where to store the model checkpoints.",
+    )
     parser.add_argument(
         "--checkpointing_steps",
         type=str,
         default="1000",
         help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
     )
-    parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
+    parser.add_argument(
+        "--seed", type=int, default=42, help="A seed for reproducible training."
+    )
     parser.add_argument(
         "--overfit_first_batch",
         action="store_true",
@@ -242,12 +270,12 @@ def parse_args():
     parser.add_argument(
         "--mu_transfer",
         action="store_true",
-        help="If specified, will train with mu transfer reparametrizations. Only supports Llama models."
+        help="If specified, will train with mu transfer reparametrizations. Only supports Llama models.",
     )
     parser.add_argument(
         "--no_compile",
         action="store_true",
-        help="If specified, will not compile the model."
+        help="If specified, will not compile the model.",
     )
 
     args = parser.parse_args()
@@ -264,13 +292,17 @@ def save_checkpoint(model, accelerator, args, filename):
 
     if accelerator.is_main_process:
         unwrapped_model.save_pretrained(
-            save_path, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+            save_path,
+            is_main_process=accelerator.is_main_process,
+            save_function=accelerator.save,
         )
         accelerator.save_state(save_path)
 
 
 @torch.no_grad()
-def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval", max_steps=1):
+def visualize(
+    accelerator, model, dataloader, window_size, metrics_prefix="eval", max_steps=1
+):
     """
     Visualizes model's autoregressive generation outputs, logged to wandb.
 
@@ -280,9 +312,13 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
     unwrapped_model = accelerator.unwrap_model(model)
 
     metadata = dataloader.dataset.metadata
-    decode_latents = decode_latents_wrapper()  # re-initializing every time to save memory
+    decode_latents = (
+        decode_latents_wrapper()
+    )  # re-initializing every time to save memory
     if accelerator.is_main_process:
-        lpips_alex = lpips.LPIPS(net="alex")  # Calculate LPIPS w/ AlexNet, the fastest option
+        lpips_alex = lpips.LPIPS(
+            net="alex"
+        )  # Calculate LPIPS w/ AlexNet, the fastest option
         metrics = {"ar_lpips": []}
 
     latent_side_len = metadata["s"]
@@ -290,17 +326,36 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
     unwrapped_model.eval()
     for step, batch in enumerate(dataloader):
         # Note: hardcoding 4 image cap for faster inference on small models
-        reshaped_labels = rearrange(batch["labels"][:4], "b (t s) -> b t s", t=window_size).to(accelerator.device)  # `s` is really `(h, w)`
+        reshaped_labels = rearrange(
+            batch["labels"][:4], "b (t s) -> b t s", t=window_size
+        ).to(
+            accelerator.device
+        )  # `s` is really `(h, w)`
 
         num_prompt_frames = window_size // 2  # hardcoding half of frames for context
-        num_new_tokens = latent_side_len ** 2 * (window_size - num_prompt_frames)
-        prompt_input_ids = rearrange(reshaped_labels[:, :num_prompt_frames], "b t s -> b (t s)")
-        outputs = unwrapped_model.generate(input_ids=prompt_input_ids, attention_mask=torch.ones_like(prompt_input_ids),
-                                           max_new_tokens=num_new_tokens, min_new_tokens=num_new_tokens)
-        output_tokens = rearrange(outputs, "b (t h w) -> b t h w", t=window_size,
-                                  h=latent_side_len, w=latent_side_len)
-        gtruth_tokens = rearrange(reshaped_labels[:, num_prompt_frames:], "b t (h w) -> b t h w",
-                                  h=latent_side_len, w=latent_side_len)
+        num_new_tokens = latent_side_len**2 * (window_size - num_prompt_frames)
+        prompt_input_ids = rearrange(
+            reshaped_labels[:, :num_prompt_frames], "b t s -> b (t s)"
+        )
+        outputs = unwrapped_model.generate(
+            input_ids=prompt_input_ids,
+            attention_mask=torch.ones_like(prompt_input_ids),
+            max_new_tokens=num_new_tokens,
+            min_new_tokens=num_new_tokens,
+        )
+        output_tokens = rearrange(
+            outputs,
+            "b (t h w) -> b t h w",
+            t=window_size,
+            h=latent_side_len,
+            w=latent_side_len,
+        )
+        gtruth_tokens = rearrange(
+            reshaped_labels[:, num_prompt_frames:],
+            "b t (h w) -> b t h w",
+            h=latent_side_len,
+            w=latent_side_len,
+        )
 
         decoded_output = decode_tokens(output_tokens.cpu(), decode_latents)
         decoded_gtruth = decode_tokens(gtruth_tokens.cpu(), decode_latents)
@@ -311,19 +366,31 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
         if accelerator.is_main_process:
             exs_per_fig = 4
             for j in range(0, len(decoded_output), exs_per_fig):
-                fig, axs = plt.subplots(nrows=2 * exs_per_fig, ncols=window_size, figsize=(3 * window_size, 3 * 2 * exs_per_fig))
+                fig, axs = plt.subplots(
+                    nrows=2 * exs_per_fig,
+                    ncols=window_size,
+                    figsize=(3 * window_size, 3 * 2 * exs_per_fig),
+                )
                 # If len(decoded_output) is not a multiple of 4, make sure to truncate properly
                 for k in range(min(exs_per_fig, len(decoded_output) - j)):
                     for i in range(num_prompt_frames):
                         for ax in (axs[k * 2, i], axs[k * 2 + 1, i]):
-                            ax.imshow(transforms_f.to_pil_image(decoded_output[j + k, i]))
+                            ax.imshow(
+                                transforms_f.to_pil_image(decoded_output[j + k, i])
+                            )
                             ax.set_title("Context")
                             ax.axis("off")
 
                     for i in range(num_prompt_frames, window_size):
-                        axs[k * 2, i].imshow(transforms_f.to_pil_image(decoded_gtruth[j + k, i - num_prompt_frames]))
+                        axs[k * 2, i].imshow(
+                            transforms_f.to_pil_image(
+                                decoded_gtruth[j + k, i - num_prompt_frames]
+                            )
+                        )
                         axs[k * 2, i].set_title("Ground truth")
-                        axs[k * 2 + 1, i].imshow(transforms_f.to_pil_image(decoded_output[j + k, i]))
+                        axs[k * 2 + 1, i].imshow(
+                            transforms_f.to_pil_image(decoded_output[j + k, i])
+                        )
                         axs[k * 2 + 1, i].set_title("Prediction")
                         for ax in axs[:, i]:
                             ax.axis("off")
@@ -332,15 +399,24 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
                 wandb_tracker.log({f"vis_{metrics_prefix}_{j}": fig}, commit=False)
                 plt.close(fig)
 
-            metrics["ar_lpips"].extend(compute_lpips(decoded_gtruth,  # Note: not parallelizing right now
-                                                     decoded_output[:, num_prompt_frames:], lpips_alex))
+            metrics["ar_lpips"].extend(
+                compute_lpips(
+                    decoded_gtruth,  # Note: not parallelizing right now
+                    decoded_output[:, num_prompt_frames:],
+                    lpips_alex,
+                )
+            )
 
         if step + 1 >= max_steps:
             break
 
     unwrapped_model.train()
     if accelerator.is_main_process:
-        metrics = {f"{metrics_prefix}_{key}": np.mean(val) for key, val in metrics.items() if len(val) > 0}
+        metrics = {
+            f"{metrics_prefix}_{key}": np.mean(val)
+            for key, val in metrics.items()
+            if len(val) > 0
+        }
 
         print(f"{metrics=}")
         wandb_tracker = accelerator.get_tracker("wandb")
@@ -349,12 +425,13 @@ def visualize(accelerator, model, dataloader, window_size, metrics_prefix="eval"
 
 def main():
     args = parse_args()
-    config_count = sum([args.llama_config is not None, args.genie_config is not None, args.vjepa_config is not None])
-    assert config_count == 1, \
-        "Exactly one of `llama_config`, `genie_config`, or `vjepa_config` should be set."
 
     # Manual gradient accumulation
-    accelerator = Accelerator(gradient_accumulation_steps=1, log_with=args.report_to, project_dir=args.output_dir)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=1,
+        log_with=args.report_to,
+        project_dir=args.output_dir,
+    )
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -376,41 +453,91 @@ def main():
 
     accelerator.wait_for_everyone()
 
-    # Choose dataset type based on model
-    if args.vjepa_config is not None:
-        print("Using tokenized dataset for V-JEPA predictor training")
-        # V-JEPA predictor always uses tokenized data (V-JEPA or COSMOS tokens)
-        train_dataset = RawTokenDataset(args.train_data_dir, window_size=args.window_size,
-                                        stride=args.stride, filter_overlaps=args.filter_overlaps)
+    # Token options
+    # 1. COSMOS discrete tokens (default)
+    # 2. V-JEPA continuous embeddings (only for V-JEPA)
+    predictor_token_type = (
+        "continuous"
+        if (
+            args.vjepa_predictor_config is not None
+            and args.vjepa_predictor_config.input_mode == "continuous"
+        )
+        else "discrete"
+    )
+    if predictor_token_type == "continuous":
+        # V-JEPA precomputed continuous embeddings dataset
+        train_dataset = VJEPAContinuousDataset(
+            args.train_data_dir,
+            window_size=args.window_size,
+            stride=args.stride,
+            filter_overlaps=args.filter_overlaps,
+        )
         if not args.overfit_first_batch:
-            eval_dataset = RawTokenDataset(args.val_data_dir, window_size=args.window_size,
-                                           stride=args.stride, filter_overlaps=True)
+            eval_dataset = VJEPAContinuousDataset(
+                args.val_data_dir,
+                window_size=args.window_size,
+                stride=args.stride,
+                filter_overlaps=True,
+            )
         else:
-            train_dataset.valid_start_inds = train_dataset.valid_start_inds[:args.per_device_train_batch_size
-                                                                             * args.gradient_accumulation_steps
-                                                                             * accelerator.num_processes]
+            # For overfit mode, use subset of training data
+            subset_size = (
+                args.per_device_train_batch_size
+                * args.gradient_accumulation_steps
+                * accelerator.num_processes
+            )
+            train_dataset.embeddings = train_dataset.embeddings[:subset_size]
+            train_dataset.actions = train_dataset.actions[:subset_size]
             eval_dataset = train_dataset
-        
-        # Use metadata from tokenized dataset
-        latent_side_len, vocab_size, hz = [train_dataset.metadata[key] for key in ("s", "vocab_size", "hz")]
-        
     else:
-        print("Using tokenized dataset for GENIE")
-        train_dataset = RawTokenDataset(args.train_data_dir, window_size=args.window_size,
-                                        stride=args.stride, filter_overlaps=args.filter_overlaps)
+        # default COSMOS discrete tokens
+        train_dataset = RawTokenDataset(
+            args.train_data_dir,
+            window_size=args.window_size,
+            stride=args.stride,
+            filter_overlaps=args.filter_overlaps,
+        )
         if not args.overfit_first_batch:
-            eval_dataset = RawTokenDataset(args.val_data_dir, window_size=args.window_size,
-                                           stride=args.stride, filter_overlaps=True)
+            eval_dataset = RawTokenDataset(
+                args.val_data_dir,
+                window_size=args.window_size,
+                stride=args.stride,
+                filter_overlaps=True,
+            )
         else:
-            train_dataset.valid_start_inds = train_dataset.valid_start_inds[:args.per_device_train_batch_size
-                                                                             * args.gradient_accumulation_steps
-                                                                             * accelerator.num_processes]
+            train_dataset.valid_start_inds = train_dataset.valid_start_inds[
+                : args.per_device_train_batch_size
+                * args.gradient_accumulation_steps
+                * accelerator.num_processes
+            ]
             eval_dataset = train_dataset
 
-        assert all(train_dataset.metadata[shared_key] == eval_dataset.metadata[shared_key]
-                   for shared_key in ("s", "vocab_size", "hz"))
+    # Handle metadata differences between discrete and continuous datasets
+    if predictor_token_type == "continuous":
+        # V-JEPA continuous embeddings metadata
+        embed_dim = train_dataset.metadata["embed_dim"]
+        num_patches = train_dataset.metadata["num_patches"]
+        hz = train_dataset.metadata["hz"]
 
-        latent_side_len, vocab_size, hz = [train_dataset.metadata[key] for key in ("s", "vocab_size", "hz")]
+        # For compatibility with GENIE evaluation, infer spatial dimensions
+        temporal_size = train_dataset.metadata.get("temporal_size", args.window_size)
+        spatial_patches = num_patches // temporal_size
+        latent_side_len = int(spatial_patches**0.5)
+        vocab_size = embed_dim  # Use embed_dim as "vocab_size" for V-JEPA
+
+        print(
+            f"V-JEPA continuous dataset: {embed_dim}D embeddings, {num_patches} patches, {latent_side_len}x{latent_side_len} spatial"
+        )
+    else:
+        # Discrete token metadata
+        assert all(
+            train_dataset.metadata[shared_key] == eval_dataset.metadata[shared_key]
+            for shared_key in ("s", "vocab_size", "hz")
+        )
+
+        latent_side_len, vocab_size, hz = [
+            train_dataset.metadata[key] for key in ("s", "vocab_size", "hz")
+        ]
 
     if args.llama_config is not None:
         raise NotImplementedError("Have not factorized Llama vocabulary.")
@@ -459,7 +586,9 @@ def main():
         #                                              attn_implementation="flash_attention_2")
     elif args.genie_config is not None:
         config = GenieConfig.from_pretrained(args.genie_config)
-        config.use_mup = args.mu_transfer  # Note: changing this may affect pre-trained model due to attn scaling
+        config.use_mup = (
+            args.mu_transfer
+        )  # Note: changing this may affect pre-trained model due to attn scaling
         config.image_vocab_size = vocab_size
         config.T = args.window_size
         config.S = latent_side_len**2
@@ -468,34 +597,57 @@ def main():
         if args.mu_transfer:
             model.set_mup_shapes(rescale_params=True)
             model.init_weights()  # might be unnecessary if `rescale_params` is True
-    else:  # args.vjepa_config is not None
-        config = VJEPAConfig.from_pretrained(args.vjepa_config)
-        config.image_vocab_size = vocab_size
+    elif args.vjepa_predictor_config is not None:
+        config = VJEPAPredictorConfig.from_pretrained(args.vjepa_predictor_config)
         config.T = args.window_size
-        config.S = latent_side_len**2
-        
+
+        if predictor_token_type == "continuous":
+            # For continuous embeddings, use embed_dim and num_patches from dataset
+            config.vjepa_embed_dim = embed_dim
+            config.image_vocab_size = 65536  # Dummy value for continuous mode
+            config.S = num_patches // args.window_size  # Spatial patches per frame
+            print(
+                f"Using VJEPAPredictor with precomputed continuous embeddings ({embed_dim}D)"
+            )
+        else:
+            # For discrete tokens, use vocab_size from dataset
+            config.image_vocab_size = vocab_size
+            config.S = latent_side_len**2
+            print("Using VJEPAPredictor for discrete token training")
+
         # V-JEPA predictor model
         model = VJEPAPredictor(config)
-        print("Using VJEPAPredictor for token-based training")
-        
+
         # V-JEPA doesn't support mu_transfer currently
         if args.mu_transfer:
             logger.warning("mu_transfer not supported for V-JEPA models, ignoring flag")
+    else:
+        raise ValueError(
+            "Exactly one of `llama_config`, `genie_config`, or `vjepa_predictor_config` should be set."
+        )
 
     # Optimizer. Split weights in two groups, one with weight decay and the other not.
     # Only include trainable parameters (important for backbone freezing)
     no_decay = ["bias", "layer_norm.weight"]
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad],
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if not any(nd in n for nd in no_decay) and p.requires_grad
+            ],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad],
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if any(nd in n for nd in no_decay) and p.requires_grad
+            ],
             "weight_decay": 0.0,
         },
     ]
-    
+
     # Print parameter counts for backbone freezing
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -503,91 +655,133 @@ def main():
         frozen_params = total_params - trainable_params
         logger.info(f"Training with backbone freezing:")
         logger.info(f"  Total parameters: {total_params:,}")
-        logger.info(f"  Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.1f}%)")
-        logger.info(f"  Frozen parameters: {frozen_params:,} ({100 * frozen_params / total_params:.1f}%)")
+        logger.info(
+            f"  Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.1f}%)"
+        )
+        logger.info(
+            f"  Frozen parameters: {frozen_params:,} ({100 * frozen_params / total_params:.1f}%)"
+        )
     else:
         logger.info(f"Training all {total_params:,} parameters")
 
     opt_class = mup.MuAdamW if args.mu_transfer else torch.optim.AdamW
-    optimizer = opt_class(optimizer_grouped_parameters, lr=args.learning_rate,
-                          betas=(args.adam_beta_1, args.adam_beta_2), eps=args.adam_eps)
+    optimizer = opt_class(
+        optimizer_grouped_parameters,
+        lr=args.learning_rate,
+        betas=(args.adam_beta_1, args.adam_beta_2),
+        eps=args.adam_eps,
+    )
 
     # DataLoaders creation:
     if args.llama_config is not None:
-        collate_fn = default_data_collator
-    elif args.vjepa_config is not None:
-        # V-JEPA predictor uses MaskGIT collator for token data
+        collate_fn = transformers.default_data_collator
+    elif predictor_token_type == "continuous":
+        # V-JEPA continuous embeddings need special collator for padding
+        collate_fn = get_vjepa_continuous_collator()
+    else:
+        # GENIE and V-JEPA discrete use MaskGIT collator
         collate_fn = get_maskgit_collator(config)
-    else:  # GENIE
-        collate_fn = get_maskgit_collator(config)
+
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=collate_fn,
-        batch_size=args.per_device_train_batch_size, num_workers=4, pin_memory=True,
+        train_dataset,
+        shuffle=True,
+        collate_fn=collate_fn,
+        batch_size=args.per_device_train_batch_size,
+        num_workers=4,
+        pin_memory=True,
     )
 
     # Shuffle eval dataset and then set shuffle=False on the dataloader.
     # Shuffling in the dataloader results in reshuffling with each iteration.
-    eval_dataset.valid_start_inds = torch.tensor(eval_dataset.valid_start_inds)[
-        torch.randperm(len(eval_dataset), generator=torch.Generator().manual_seed(0))
-    ].tolist()
+    if hasattr(eval_dataset, "valid_start_inds"):
+        eval_dataset.valid_start_inds = torch.tensor(eval_dataset.valid_start_inds)[
+            torch.randperm(
+                len(eval_dataset), generator=torch.Generator().manual_seed(0)
+            )
+        ].tolist()
 
     eval_dataloader = DataLoader(
-        eval_dataset, shuffle=False, collate_fn=collate_fn,
-        batch_size=args.per_device_eval_batch_size, pin_memory=True,
+        eval_dataset,
+        shuffle=False,
+        collate_fn=collate_fn,
+        batch_size=args.per_device_eval_batch_size,
+        pin_memory=True,
     )
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    if args.lr_scheduler_type == "custom_cosine":  # decay to `end_ratio` of the peak learning rate
+    if (
+        args.lr_scheduler_type == "custom_cosine"
+    ):  # decay to `end_ratio` of the peak learning rate
+
         def get_lr_wrapper(warmup_steps, max_steps, end_ratio=0.1):
             def get_lr(step):
                 if step < warmup_steps:
                     return (step + 1) / warmup_steps
 
                 remaining_steps = max_steps - warmup_steps
-                return ((1 + math.cos(math.pi * (step - warmup_steps) / remaining_steps)) / 2) \
-                    * (1 - end_ratio) + end_ratio
+                return (
+                    (1 + math.cos(math.pi * (step - warmup_steps) / remaining_steps))
+                    / 2
+                ) * (1 - end_ratio) + end_ratio
+
             return get_lr
 
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, get_lr_wrapper(args.num_warmup_steps * accelerator.num_processes,
-                                      args.max_train_steps if overrode_max_train_steps
-                                      else args.max_train_steps * accelerator.num_processes)
+            optimizer,
+            get_lr_wrapper(
+                args.num_warmup_steps * accelerator.num_processes,
+                (
+                    args.max_train_steps
+                    if overrode_max_train_steps
+                    else args.max_train_steps * accelerator.num_processes
+                ),
+            ),
         )
     else:
-        lr_scheduler = get_scheduler(
+        lr_scheduler = transformers.get_scheduler(
             name=args.lr_scheduler_type,
             optimizer=optimizer,
             num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
-            num_training_steps=args.max_train_steps
-            if overrode_max_train_steps
-            else args.max_train_steps * accelerator.num_processes,
+            num_training_steps=(
+                args.max_train_steps
+                if overrode_max_train_steps
+                else args.max_train_steps * accelerator.num_processes
+            ),
         )
 
     # Enable gradient checkpointing to save memory
     if args.gradient_checkpointing:
         logger.info("Enabling gradient checkpointing")
         model.gradient_checkpointing_enable()
-        model.config.use_cache = False # incompatible with grad checkpointing
+        model.config.use_cache = False  # incompatible with grad checkpointing
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = (
+        accelerator.prepare(
+            model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+        )
     )
 
     if not args.no_compile:
         torch._dynamo.config.cache_size_limit = 128
-        torch._dynamo.config.optimize_ddp = False  # https://github.com/pytorch/pytorch/issues/104674
+        torch._dynamo.config.optimize_ddp = (
+            False  # https://github.com/pytorch/pytorch/issues/104674
+        )
         # TODO: https://github.com/pytorch/pytorch/issues/109774#issuecomment-2046633776
         model = torch.compile(model)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
 
@@ -604,43 +798,63 @@ def main():
     experiment_config = vars(args) | vars(config)
 
     seq_len = latent_side_len**2 * args.window_size
-    effective_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps \
-                           * accelerator.num_processes
+    effective_batch_size = (
+        args.per_device_train_batch_size
+        * args.gradient_accumulation_steps
+        * accelerator.num_processes
+    )
 
-    experiment_config.update({
-        "model_parameters": sum(p.numel() for p in model.parameters()),
-        "model_parameters_M": round(sum(p.numel() for p in model.parameters()) / 1e6),
-        "seq_len": seq_len,
-        "hz": hz / args.stride,
-        "train_data_tokens": len(train_dataset) * seq_len,
-        "effective_batch_size": effective_batch_size,
-        "effective_batch_size_tokens": effective_batch_size * seq_len,
-        "mixed_precision": accelerator.mixed_precision,
-    })
+    experiment_config.update(
+        {
+            "model_parameters": sum(p.numel() for p in model.parameters()),
+            "model_parameters_M": round(
+                sum(p.numel() for p in model.parameters()) / 1e6
+            ),
+            "seq_len": seq_len,
+            "hz": hz / args.stride,
+            "train_data_tokens": len(train_dataset) * seq_len,
+            "effective_batch_size": effective_batch_size,
+            "effective_batch_size_tokens": effective_batch_size * seq_len,
+            "mixed_precision": accelerator.mixed_precision,
+        }
+    )
 
-    experiment_config["FLOPs_per_update_step"] = 6 * experiment_config["model_parameters"] \
-                                                 * experiment_config["effective_batch_size_tokens"]
+    experiment_config["FLOPs_per_update_step"] = (
+        6
+        * experiment_config["model_parameters"]
+        * experiment_config["effective_batch_size_tokens"]
+    )
 
     # Initialize wandb tracker with optional project and run name
     init_kwargs = {"project_name": args.wandb_project_name, "config": experiment_config}
     if args.wandb_run_name:
         init_kwargs["init_kwargs"] = {"wandb": {"name": args.wandb_run_name}}
-    
+
     accelerator.init_trackers(**init_kwargs)
 
     # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    total_batch_size = (
+        args.per_device_train_batch_size
+        * accelerator.num_processes
+        * args.gradient_accumulation_steps
+    )
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(
+        f"  Instantaneous batch size per device = {args.per_device_train_batch_size}"
+    )
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
+    )
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(
+        range(args.max_train_steps), disable=not accelerator.is_local_main_process
+    )
     completed_steps = 0
     starting_epoch = 0
 
@@ -653,14 +867,18 @@ def main():
             # Get the most recent checkpoint
             dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
             dirs.sort(key=os.path.getctime)
-            path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
+            path = dirs[
+                -1
+            ]  # Sorts folders by date modified, most recent checkpoint is the last
             checkpoint_path = path
             path = os.path.basename(checkpoint_path)
 
         accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
         tied_weights = getattr(config, "tie_word_embeddings", False)
-        accelerator.load_state(checkpoint_path, strict=not tied_weights)  # tied weights not saved so can't load strict, but also no need to tie again
+        accelerator.load_state(
+            checkpoint_path, strict=not tied_weights
+        )  # tied weights not saved so can't load strict, but also no need to tie again
 
         # Extract `epoch_{i}` or `step_{i}`
         training_difference = os.path.splitext(path)[0]
@@ -671,7 +889,10 @@ def main():
             completed_steps = starting_epoch * num_update_steps_per_epoch
         else:
             # need to multiply `gradient_accumulation_steps` to reflect real steps
-            resume_step = int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
+            resume_step = (
+                int(training_difference.replace("step_", ""))
+                * args.gradient_accumulation_steps
+            )
             starting_epoch = resume_step // len(train_dataloader)
             completed_steps = resume_step // args.gradient_accumulation_steps
             resume_step -= starting_epoch * len(train_dataloader)
@@ -682,9 +903,15 @@ def main():
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
-        if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
+        if (
+            args.resume_from_checkpoint
+            and epoch == starting_epoch
+            and resume_step is not None
+        ):
             # We skip the first `n` batches in the dataloader when resuming from a checkpoint
-            active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
+            active_dataloader = accelerator.skip_first_batches(
+                train_dataloader, resume_step
+            )
         else:
             active_dataloader = train_dataloader
 
@@ -693,7 +920,11 @@ def main():
             batch_size = batch["input_ids"].size(0)
             # Manual gradient accumulation because accelerator somehow taking a lot of memory
             is_update_step = (step + 1) % args.gradient_accumulation_steps == 0
-            ctx_manager = contextlib.nullcontext() if is_update_step else accelerator.no_sync(model)
+            ctx_manager = (
+                contextlib.nullcontext()
+                if is_update_step
+                else accelerator.no_sync(model)
+            )
 
             with ctx_manager:
                 outputs = model(**batch)
@@ -731,17 +962,26 @@ def main():
                     "train_loss": avg_train_loss,
                     "epoch": epoch,
                     "update_step": completed_steps,
-                    "examples_processed": completed_steps * args.per_device_train_batch_size
-                                          * args.gradient_accumulation_steps * accelerator.num_processes,
+                    "examples_processed": completed_steps
+                    * args.per_device_train_batch_size
+                    * args.gradient_accumulation_steps
+                    * accelerator.num_processes,
                     "learning_rate": lr_scheduler.get_last_lr()[0],
-                    "flops": (completed_steps + 1) * experiment_config["FLOPs_per_update_step"],
-                    "throughput_examples": experiment_config["effective_batch_size"] / batch_time,
-                }, step=completed_steps)
+                    "flops": (completed_steps + 1)
+                    * experiment_config["FLOPs_per_update_step"],
+                    "throughput_examples": experiment_config["effective_batch_size"]
+                    / batch_time,
+                },
+                step=completed_steps,
+            )
 
             progress_bar.update(1)
             completed_steps += 1
 
-            if isinstance(checkpointing_steps, int) and completed_steps % checkpointing_steps == 0:
+            if (
+                isinstance(checkpointing_steps, int)
+                and completed_steps % checkpointing_steps == 0
+            ):
                 save_checkpoint(model, accelerator, args, f"step_{completed_steps}")
 
             if completed_steps % args.eval_every_n_steps == 0:
@@ -758,18 +998,37 @@ def main():
                         outputs = model(**batch)
 
                     loss = outputs.loss
-                    eval_losses.append(accelerator.gather_for_metrics(loss.repeat(batch_size)))
+                    eval_losses.append(
+                        accelerator.gather_for_metrics(loss.repeat(batch_size))
+                    )
 
                     if "acc" in outputs:  # TODO: don't reduce here
                         # `num_correct` and `num_total` actually track mean accuracy in this case.
-                        num_correct += accelerator.reduce(outputs.acc, reduction="mean").item() * batch_size
+                        num_correct += (
+                            accelerator.reduce(outputs.acc, reduction="mean").item()
+                            * batch_size
+                        )
                         num_total += batch_size
                     else:
                         shifted_preds = torch.argmax(outputs.logits[:, :-1, :], dim=-1)
                         shifted_labels = batch["labels"][:, 1:]
-                        num_correct += accelerator.gather_for_metrics((shifted_preds == shifted_labels).sum()).sum().item()
-                        num_total += accelerator.gather_for_metrics(torch.tensor(torch.numel(shifted_labels),
-                                                                                 device=accelerator.device)).sum().item()
+                        num_correct += (
+                            accelerator.gather_for_metrics(
+                                (shifted_preds == shifted_labels).sum()
+                            )
+                            .sum()
+                            .item()
+                        )
+                        num_total += (
+                            accelerator.gather_for_metrics(
+                                torch.tensor(
+                                    torch.numel(shifted_labels),
+                                    device=accelerator.device,
+                                )
+                            )
+                            .sum()
+                            .item()
+                        )
                     if step >= args.max_eval_steps:
                         break
 
@@ -781,7 +1040,9 @@ def main():
                 except OverflowError:
                     perplexity = float("inf")
 
-                logger.info(f"{completed_steps=} {perplexity=} {eval_loss=} {eval_teacher_acc=}")
+                logger.info(
+                    f"{completed_steps=} {perplexity=} {eval_loss=} {eval_teacher_acc=}"
+                )
 
                 accelerator.log(
                     {
@@ -790,9 +1051,12 @@ def main():
                         "eval_teacher_acc": eval_teacher_acc,
                         "epoch": epoch,
                         "update_step": completed_steps,
-                        "examples_processed": completed_steps * args.per_device_train_batch_size
-                                              * args.gradient_accumulation_steps * accelerator.num_processes,
-                        "flops": completed_steps * experiment_config["FLOPs_per_update_step"],
+                        "examples_processed": completed_steps
+                        * args.per_device_train_batch_size
+                        * args.gradient_accumulation_steps
+                        * accelerator.num_processes,
+                        "flops": completed_steps
+                        * experiment_config["FLOPs_per_update_step"],
                     },
                     step=completed_steps,
                 )
@@ -802,9 +1066,13 @@ def main():
 
             if completed_steps % args.vis_every_n_steps == 0:
                 if not args.overfit_first_batch:  # val is same as train otherwise
-                    visualize(accelerator, model, eval_dataloader, args.window_size, "val")
+                    visualize(
+                        accelerator, model, eval_dataloader, args.window_size, "val"
+                    )
 
-                visualize(accelerator, model, train_dataloader, args.window_size, "train")
+                visualize(
+                    accelerator, model, train_dataloader, args.window_size, "train"
+                )
 
             if completed_steps >= args.max_train_steps:
                 break

@@ -1,130 +1,112 @@
 import json
 from dataclasses import dataclass
+
 from transformers import PretrainedConfig
+
 # from typing import Optional
 
 
 class VJEPAEncoderConfig(PretrainedConfig):
     """Configuration for V-JEPA Encoder (ViT-G backbone for continuous embeddings)"""
-    
+
     def __init__(
         self,
-        # V-JEPA2 backbone config
-        model_name: str = "vit_ac_giant",  # vit_ac_giant, vit_ac_large
-        img_size: int = 256,
-        patch_size: int = 16,
-        tubelet_size: int = 2,
-        num_frames: int = 16,
         pretrained: bool = True,
-        
-        # Output config
         vjepa_embed_dim: int = 1408,  # ViT-G embedding dimension
-        
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
-        
-        # V-JEPA2 backbone config
-        self.model_name = model_name
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.tubelet_size = tubelet_size
-        self.num_frames = num_frames
         self.pretrained = pretrained
-        
-        # Output config
         self.vjepa_embed_dim = vjepa_embed_dim
-    
+
+        # Validation
+        if not isinstance(pretrained, bool):
+            raise TypeError(f"pretrained must be bool, got {type(pretrained)}")
+        if not isinstance(vjepa_embed_dim, int) or vjepa_embed_dim <= 0:
+            raise ValueError(
+                f"vjepa_embed_dim must be positive int, got {vjepa_embed_dim}"
+            )
+
     def shallow_copy(self):
         return VJEPAEncoderConfig(**self.to_dict())
 
 
 class VJEPAPredictorConfig(PretrainedConfig):
     """Configuration for V-JEPA Predictor"""
-    
+
     def __init__(
         self,
-        # V-JEPA2 predictor config
-        model_name: str = "vit_ac_giant",
+        # Model config
         pretrained: bool = True,
-        pred_depth: int = 24,
-        pred_num_heads: int = 16,
-        pred_embed_dim: int = 1024,
-        pred_is_frame_causal: bool = True,
-        use_extrinsics: bool = False,
-        
-        # 1X specific config
-        T: int = 16,  # temporal sequence length (frames)
-        S: int = 256,  # spatial sequence length (16x16 = 256)
-        image_vocab_size: int = 262144,  # 2^18 MAGVIT2 vocab
-        
-        # Input mode config
-        input_mode: str = "discrete",  # "discrete" (COSMOS tokens) or "continuous" (V-JEPA embeddings)
-        vjepa_embed_dim: int = 1408,  # ViT-G embedding dimension (for continuous mode)
-        
-        # Factorization config (same as GENIE)
+        freeze_backbone: bool = True,
+        # Data dimensions
+        T: int = 16,  # temporal frames
+        S: int = 256,  # spatial patches
+        image_vocab_size: int = 262144,
+        # Input mode
+        input_mode: str = "discrete",  # "discrete" or "continuous"
+        vjepa_embed_dim: int = 1408,  # ViT-G dimension
+        # Factorization
         num_factored_vocabs: int = 2,
-        factored_vocab_size: int = 512,  # 512^2 = 262144
-        
-        # Action config for 1X dataset
-        action_vocab_size: int = 65536,  # uint16 action tokens
-        action_embed_dim: int = 256,  # embedding dimension for scalar actions
-        
-        # Training config
-        loss_type: str = "cross_entropy",  # "cross_entropy", "l1"
-        l1_loss_weight: float = 1.0,
+        factored_vocab_size: int = 512,
+        # Actions
+        action_vocab_size: int = 65536,
+        action_embed_dim: int = 256,
+        # Training
         token_loss_weight: float = 1.0,
-        freeze_backbone: bool = True,  # Freeze V-JEPA encoder, train only predictor
-        
-        # MaskGIT training config
-        max_corrupt_rate: float = 0.2,  # Corrupt all tokens, uniform between [0, max_corrupt_rate]
-        non_mlm_ratio: float = 0.5,
-        num_prompt_frames: int = 8,
-        
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
-        
-        # V-JEPA2 predictor config
-        self.model_name = model_name
+
+        # Validation
+        if input_mode not in ["discrete", "continuous"]:
+            raise ValueError(
+                f"input_mode must be 'discrete' or 'continuous', got '{input_mode}'"
+            )
+        if not isinstance(T, int) or T <= 0:
+            raise ValueError(f"T must be positive int, got {T}")
+        if not isinstance(S, int) or S <= 0:
+            raise ValueError(f"S must be positive int, got {S}")
+        if not isinstance(vjepa_embed_dim, int) or vjepa_embed_dim <= 0:
+            raise ValueError(
+                f"vjepa_embed_dim must be positive int, got {vjepa_embed_dim}"
+            )
+        if not isinstance(num_factored_vocabs, int) or num_factored_vocabs <= 0:
+            raise ValueError(
+                f"num_factored_vocabs must be positive int, got {num_factored_vocabs}"
+            )
+        if not isinstance(factored_vocab_size, int) or factored_vocab_size <= 0:
+            raise ValueError(
+                f"factored_vocab_size must be positive int, got {factored_vocab_size}"
+            )
+        if not isinstance(token_loss_weight, (int, float)) or token_loss_weight < 0:
+            raise ValueError(
+                f"token_loss_weight must be non-negative number, got {token_loss_weight}"
+            )
+
+        # Model config
         self.pretrained = pretrained
-        self.pred_depth = pred_depth
-        self.pred_num_heads = pred_num_heads
-        self.pred_embed_dim = pred_embed_dim
-        self.pred_is_frame_causal = pred_is_frame_causal
-        self.use_extrinsics = use_extrinsics
-        
-        # 1X specific config
+        self.freeze_backbone = freeze_backbone
+
+        # Data dimensions
         self.T = T
         self.S = S
         self.image_vocab_size = image_vocab_size
-        
-        # Input mode config
+
+        # Input mode
         self.input_mode = input_mode
         self.vjepa_embed_dim = vjepa_embed_dim
-        
-        # Factorization config (same as GENIE)
+
+        # Factorization
         self.num_factored_vocabs = num_factored_vocabs
         self.factored_vocab_size = factored_vocab_size
-        
-        # Action config for 1X dataset
+
+        # Actions
         self.action_vocab_size = action_vocab_size
         self.action_embed_dim = action_embed_dim
-        
-        # Training config
-        self.loss_type = loss_type
-        self.l1_loss_weight = l1_loss_weight
+
+        # Training
         self.token_loss_weight = token_loss_weight
-        self.freeze_backbone = freeze_backbone
-        
-        # MaskGIT training config
-        self.max_corrupt_rate = max_corrupt_rate
-        self.non_mlm_ratio = non_mlm_ratio
-        self.num_prompt_frames = num_prompt_frames
-    
+
     def shallow_copy(self):
         return VJEPAPredictorConfig(**self.to_dict())
-
-
-# Legacy alias for backward compatibility
-VJEPAConfig = VJEPAPredictorConfig

@@ -5,3 +5,4 @@ data/
 .idea/
 subsample_val.py
 wandb
+.claude

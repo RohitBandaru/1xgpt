@@ -64,11 +64,24 @@ python evaluate.py --model_type genie --checkpoint_dir data/genie_model/final_ch
 
 ## V-JEPA (ViT-Giant World Model)
 
-This repo provides a V-JEPA2-AC based world model that supports **two input types**: precomputed COSMOS tokens (for 1X challenge) and continuous V-JEPA embeddings (for research).
+This repo provides a V-JEPA2-AC based world model that supports **three distinct training workflows**:
 
-### 🎯 Two V-JEPA Input Modes
+1. **GENIE + COSMOS tokens** (baseline)
+2. **V-JEPA + COSMOS tokens** (1X challenge)
+3. **V-JEPA + continuous embeddings** (research)
 
-#### Mode 1: COSMOS Tokens (1X Challenge Compatible)
+### 🎯 Three Training Workflows
+
+#### Workflow 1: GENIE + COSMOS Tokens (Baseline)
+```bash
+# Train GENIE on COSMOS tokens
+python train.py \
+  --genie_config genie/configs/magvit_n32_h8_d256.json \
+  --train_data_dir data/train_v1.1 \
+  --output_dir data/genie_model
+```
+
+#### Workflow 2: V-JEPA + COSMOS Tokens (1X Challenge)
 Train V-JEPA predictor on precomputed COSMOS tokens from 1X dataset:
 
 ```bash
@@ -77,45 +90,25 @@ python train.py \
   --vjepa_config vjepa/configs/cosmos_predictor.json \
   --train_data_dir data/train_v1.1 \
   --output_dir data/vjepa_cosmos_model
-
-# Evaluate COSMOS predictor
-python evaluate.py --model_type vjepa --checkpoint_dir data/vjepa_cosmos_model/final_checkpt
 ```
 
-#### Mode 2: Continuous V-JEPA Embeddings (Research)
-Generate continuous embeddings and train predictor on them:
+#### Workflow 3: V-JEPA + Continuous Embeddings (Research)
+Generate continuous embeddings and train predictor on them (two-step process):
 
 ```bash
-# Generate continuous V-JEPA embeddings from raw video
+# Step 1: Generate continuous V-JEPA embeddings from raw video
 python tokenize_videos.py \
   --input_dir data/raw_video \
   --output_dir data/vjepa_embeddings \
   --config_path vjepa/configs/vjepa_encoder.json
 
-# Train V-JEPA predictor on continuous embeddings
+# Step 2: Train V-JEPA predictor on continuous embeddings
 python train.py \
   --vjepa_config vjepa/configs/vjepa_predictor.json \
-  --train_data_dir data/vjepa_embeddings \
+  --train_data_dir data/vjepa_embeddings/train_v1.1 \
   --output_dir data/vjepa_embedding_model
-
-# Evaluate embedding predictor  
-python evaluate.py --model_type vjepa --checkpoint_dir data/vjepa_embedding_model/final_checkpt
 ```
 
-### V-JEPA vs GENIE Comparison
-
-| Model | Architecture | Parameters | Input Type | Target Loss |
-|-------|-------------|------------|------------|-------------|
-| **GENIE** | Spatio-temporal MaskGIT | 138M | COSMOS tokens | 8.79 (baseline) |
-| **V-JEPA (COSMOS)** | ViT-Giant Predictor | 1.7B | COSMOS tokens | <8.0 (prize) |
-| **V-JEPA (Embeddings)** | ViT-Giant Full Pipeline | 1.7B | Continuous embeddings | Research |
-
-**Key V-JEPA advantages:**
-- 12x more parameters than GENIE (1.7B vs 138M)
-- Pretrained on internet-scale video data  
-- Native action conditioning support
-- **Rich continuous representations** from ViT-Giant backbone
-- **Flexible input modes**: COSMOS tokens or V-JEPA embeddings
 
 ### Configuration Files
 
